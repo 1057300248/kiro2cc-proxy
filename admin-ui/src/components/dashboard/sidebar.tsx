@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Harllan He. Licensed under MIT.
 // 侧边栏区块（自 dashboard.tsx 拆出，纯代码搬移）
 import { useTranslation } from 'react-i18next'
-import { LogOut, Server, PanelLeftClose, PanelLeftOpen, Sun, Moon } from 'lucide-react'
+import { Languages, LogOut, Server, PanelLeftClose, PanelLeftOpen, Sun, Moon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import { ADMIN_NAME } from '@/components/dashboard/panel-constants'
+import { LANG_STORAGE_KEY } from '@/i18n'
 
 export interface NavItem {
   key: string
@@ -40,7 +40,17 @@ export function Sidebar({
   handleLogout,
   toggleTheme,
 }: SidebarProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const language = i18n.language === 'en' ? 'en' : 'zh'
+  const nextLanguage = language === 'en' ? 'zh' : 'en'
+  const nextLanguageLabel = nextLanguage === 'en'
+    ? t('settings.languageEn')
+    : t('settings.languageZh')
+
+  const toggleLanguage = () => {
+    i18n.changeLanguage(nextLanguage)
+    localStorage.setItem(LANG_STORAGE_KEY, nextLanguage)
+  }
 
   // 页脚状态点：加载中 / 请求失败时 serverInfo 为 undefined；已有缓存后端再断开则由 isError 兜底转灰
   const serverHealthy = !!serverInfo?.version && !serverInfoError
@@ -146,29 +156,34 @@ export function Sidebar({
             ))}
           </TooltipProvider>
         </nav>
-        {/* 身份区（设计稿 .side-user）：头像 + 名称 / 角色 + 退出（hover 转 danger） */}
+        {/* 语言区：替换身份信息，主题切换仍独立保留 */}
         <div className={`flex items-center border-t border-hairline ${sidebarContentCollapsed ? 'flex-col gap-[9px] py-2.5' : 'gap-[9px] px-3 py-2.5'}`}>
-          <div aria-hidden="true" className="grid h-7 w-7 shrink-0 place-items-center rounded-[8px] border border-hairline-2 bg-surface-3 text-[11.5px] font-bold text-ink-2">
-            {ADMIN_NAME.charAt(0).toUpperCase()}
-          </div>
-          {!sidebarContentCollapsed && (
-            <div className="min-w-0">
-              <div className="text-[12px] font-semibold leading-[1.3]">{ADMIN_NAME}</div>
-              <div className="text-[10px] text-ink-3">{t('dashboard.adminRole')}</div>
-            </div>
-          )}
+          <Button
+            variant="ghost"
+            className={`h-8 shrink-0 text-ink-2 hover:bg-brand-soft hover:text-brand ${sidebarContentCollapsed ? 'w-8 px-0' : 'gap-2 px-2'}`}
+            onClick={toggleLanguage}
+            title={t('dashboard.switchLanguageTo', { language: nextLanguageLabel })}
+            aria-label={t('dashboard.switchLanguageTo', { language: nextLanguageLabel })}
+          >
+            <Languages className="h-3.5 w-3.5 shrink-0" />
+            {!sidebarContentCollapsed && (
+              <span className="rounded-[5px] bg-surface-3 px-1.5 py-0.5 text-[10px] font-semibold text-ink-3">
+                {nextLanguage === 'en' ? 'EN' : '中'}
+              </span>
+            )}
+          </Button>
           <Button
             variant="ghost"
             size="icon"
-            className={`h-7 w-7 shrink-0 text-ink-3 hover:bg-danger-soft hover:text-danger ${sidebarContentCollapsed ? '' : 'ml-auto'}`}
-            onClick={handleLogout}
-            title={t('common.logout')}
-            aria-label={t('common.logout')}
+            className={`h-7 w-7 shrink-0 text-ink-3 hover:bg-surface-3 hover:text-ink-2 ${sidebarContentCollapsed ? '' : 'ml-auto'}`}
+            onClick={(e) => toggleTheme(e.clientX, e.clientY)}
+            title={theme === 'dark' ? t('dashboard.toggleLightMode') : t('dashboard.toggleDarkMode')}
+            aria-label={theme === 'dark' ? t('dashboard.toggleLightMode') : t('dashboard.toggleDarkMode')}
           >
-            <LogOut className="h-3.5 w-3.5" />
+            {theme === 'dark' ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
           </Button>
         </div>
-        {/* 页脚（设计稿 .side-foot）：运行状态点 + 版本号 + 主题切换 */}
+        {/* 页脚（设计稿 .side-foot）：运行状态点 + 版本号 + 退出登录 */}
         <div className={`flex items-center border-t border-hairline ${sidebarContentCollapsed ? 'flex-col gap-[9px] py-2.5' : 'gap-2 px-[14px] py-2.5'}`}>
           <span
             role="img"
@@ -190,12 +205,12 @@ export function Sidebar({
           <Button
             variant="ghost"
             size="icon"
-            className={`h-7 w-7 shrink-0 text-ink-3 hover:bg-surface-3 hover:text-ink-2 ${sidebarContentCollapsed ? '' : 'ml-auto'}`}
-            onClick={(e) => toggleTheme(e.clientX, e.clientY)}
-            title={theme === 'dark' ? t('dashboard.toggleLightMode') : t('dashboard.toggleDarkMode')}
-            aria-label={theme === 'dark' ? t('dashboard.toggleLightMode') : t('dashboard.toggleDarkMode')}
+            className={`h-7 w-7 shrink-0 text-ink-3 hover:bg-danger-soft hover:text-danger ${sidebarContentCollapsed ? '' : 'ml-auto'}`}
+            onClick={handleLogout}
+            title={t('common.logout')}
+            aria-label={t('common.logout')}
           >
-            {theme === 'dark' ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
+            <LogOut className="h-3.5 w-3.5" />
           </Button>
         </div>
         </div>

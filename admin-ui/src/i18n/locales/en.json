@@ -60,6 +60,7 @@
     "navSettings": "Settings",
     "toggleLightMode": "Switch to light mode",
     "toggleDarkMode": "Switch to dark mode",
+    "switchLanguageTo": "Switch to {{language}}",
     "collapseSidebar": "Collapse sidebar",
     "expandSidebar": "Expand sidebar",
     "pageSubtitle": "Manage account pool, quota and throttling",
