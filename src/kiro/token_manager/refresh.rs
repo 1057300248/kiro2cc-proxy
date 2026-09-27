@@ -355,11 +355,11 @@ async fn refresh_external_idp_token(
         ("client_id", client_id.as_str()),
     ];
     let scopes_owned;
-    if let Some(ref s) = credentials.scopes {
-        if !s.is_empty() {
-            scopes_owned = s.clone();
-            params.push(("scope", scopes_owned.as_str()));
-        }
+    if let Some(ref s) = credentials.scopes
+        && !s.is_empty()
+    {
+        scopes_owned = s.clone();
+        params.push(("scope", scopes_owned.as_str()));
     }
 
     let client = build_client(proxy, 60, config.tls_backend)?;
