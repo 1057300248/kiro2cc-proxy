@@ -609,57 +609,34 @@ impl MultiTokenManager {
 
     /// 删除账号（Admin API）
     ///
-    /// # 前置条件
-    /// - 账号必须已禁用（disabled = true）
-    ///
     /// # 行为
     /// 1. 验证账号存在
-    /// 2. 验证账号已禁用
-    /// 3. 从 entries 移除
-    /// 4. 如果删除的是当前账号，切换到优先级最高的可用账号
-    /// 5. 如果删除后没有账号，将 current_id 重置为 0
-    /// 6. 持久化到文件
+    /// 2. 从 entries 移除
+    /// 3. 如果删除的是当前账号，切换到优先级最高的可用账号
+    /// 4. 没有可用账号时，将 current_id 重置为 0
+    /// 5. 持久化到文件
     ///
     /// # 返回
     /// - `Ok(())` - 删除成功
-    /// - `Err(_)` - 账号不存在、未禁用或持久化失败
+    /// - `Err(_)` - 账号不存在或持久化失败
     pub fn delete_credential(&self, id: u64) -> anyhow::Result<()> {
-        let was_current = {
+        {
             let mut entries = self.entries.lock();
-
-            // 查找账号
-            let entry = entries
+            let mut current_id = self.current_id.lock();
+            let index = entries
                 .iter()
-                .find(|e| e.id == id)
+                .position(|entry| entry.id == id)
                 .ok_or_else(|| anyhow::anyhow!("账号不存在: {}", id))?;
 
-            // 检查是否已禁用
-            if !entry.disabled {
-                anyhow::bail!("只能删除已禁用的账号（请先禁用账号 #{}）", id);
-            }
+            entries.remove(index);
 
-            // 记录是否是当前账号
-            let current_id = *self.current_id.lock();
-            let was_current = current_id == id;
-
-            // 删除账号
-            entries.retain(|e| e.id != id);
-
-            was_current
-        };
-
-        // 如果删除的是当前账号，切换到优先级最高的可用账号
-        if was_current {
-            self.select_highest_priority();
-        }
-
-        // 如果删除后没有任何账号，将 current_id 重置为 0（与初始化行为保持一致）
-        {
-            let entries = self.entries.lock();
-            if entries.is_empty() {
-                let mut current_id = self.current_id.lock();
-                *current_id = 0;
-                tracing::info!("所有账号已删除，current_id 已重置为 0");
+            if *current_id == id {
+                *current_id = entries
+                    .iter()
+                    .filter(|entry| !entry.disabled)
+                    .min_by_key(|entry| entry.credentials.priority)
+                    .map(|entry| entry.id)
+                    .unwrap_or(0);
             }
         }
 

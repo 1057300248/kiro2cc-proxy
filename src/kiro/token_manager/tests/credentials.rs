@@ -52,8 +52,6 @@ pub(crate) mod tests {
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
-        // 删除账号必须先禁用
-        manager.set_disabled(2, true).unwrap();
         manager.delete_credential(2).unwrap();
         assert_eq!(manager.total_count(), 1);
 
@@ -100,8 +98,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        // 删除账号 #2（必须先禁用），并持久化
-        manager.set_disabled(2, true).unwrap();
+        // 删除启用中的账号 #2，并持久化
         manager.delete_credential(2).unwrap();
         manager.persist_credentials().unwrap();
         assert_eq!(manager.total_count(), 1);
@@ -133,6 +130,117 @@ pub(crate) mod tests {
             "重启后新增账号仍不应复用已删除账号 #2 的 ID，实际: {}",
             new_id
         );
+    }
+
+    #[test]
+    fn test_delete_enabled_current_credential_switches_to_highest_priority_available() {
+        let current = KiroCredentials {
+            id: Some(1),
+            priority: 1,
+            ..Default::default()
+        };
+        let replacement = KiroCredentials {
+            id: Some(2),
+            priority: 5,
+            ..Default::default()
+        };
+        let fallback = KiroCredentials {
+            id: Some(3),
+            priority: 10,
+            ..Default::default()
+        };
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![current, replacement, fallback],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manager.snapshot().current_id, 1);
+
+        manager.delete_credential(1).unwrap();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.current_id, 2);
+        assert!(!snapshot.entries.iter().any(|entry| entry.id == 1));
+    }
+
+    #[test]
+    fn test_delete_enabled_non_current_credential_keeps_current_id() {
+        let current = KiroCredentials {
+            id: Some(1),
+            priority: 1,
+            ..Default::default()
+        };
+        let deleted = KiroCredentials {
+            id: Some(2),
+            priority: 2,
+            ..Default::default()
+        };
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![current, deleted], None, None, false)
+                .unwrap();
+
+        manager.delete_credential(2).unwrap();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.current_id, 1);
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].id, 1);
+    }
+
+    #[test]
+    fn test_delete_missing_credential_preserves_current_state() {
+        let current = KiroCredentials {
+            id: Some(1),
+            ..Default::default()
+        };
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![current], None, None, false).unwrap();
+
+        assert!(manager.delete_credential(2).is_err());
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.current_id, 1);
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].id, 1);
+    }
+
+    #[test]
+    fn test_delete_current_credential_resets_current_id_without_available_replacement() {
+        let current = KiroCredentials {
+            id: Some(1),
+            priority: 1,
+            ..Default::default()
+        };
+        let disabled = KiroCredentials {
+            id: Some(2),
+            priority: 2,
+            disabled: true,
+            ..Default::default()
+        };
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![current, disabled],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager.delete_credential(1).unwrap();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.current_id, 0);
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].id, 2);
+        assert!(snapshot.entries[0].disabled);
     }
 
     /// 回归测试：启动加载时为无 profileArn 的 social/idc 存量账号自动补全 fallback ARN

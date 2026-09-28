@@ -156,12 +156,6 @@ export function AccountRow({
   }
 
   const handleDelete = () => {
-    // 与旧卡片同约束：仅已禁用账号可删；菜单项已禁用，此处为二次兜底
-    if (!credential.disabled) {
-      toast.error(t('credentials.toastDisableFirst'))
-      setShowDeleteDialog(false)
-      return
-    }
     deleteCredential.mutate(credential.id, {
       onSuccess: res => {
         toast.success(res.message)
@@ -481,16 +475,9 @@ export function AccountRow({
                 <RefreshCw className="size-[13px]" strokeWidth={1.7} />
                 {t('credentials.resetFailureCount')}
               </DropdownMenuItem>
-              <DropdownMenuItem danger onSelect={() => setShowDeleteDialog(true)} disabled={!credential.disabled}>
-                {/* title 挂内层：禁用项带 pointer-events-none，而它可被子元素 auto 撤销
-                    （与 opacity 不同），否则「需先禁用账号」的原因无法 hover 获知 */}
-                <span
-                  className="pointer-events-auto flex items-center gap-2"
-                  title={credential.disabled ? undefined : t('credentials.deleteNeedsDisableTitle')}
-                >
-                  <Trash2 className="size-[13px]" strokeWidth={1.7} />
-                  {t('common.delete')}
-                </span>
+              <DropdownMenuItem danger onSelect={() => setShowDeleteDialog(true)}>
+                <Trash2 className="size-[13px]" strokeWidth={1.7} />
+                {t('common.delete')}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -514,7 +501,7 @@ export function AccountRow({
               <Button
                 variant="destructive"
                 onClick={handleDelete}
-                disabled={deleteCredential.isPending || !credential.disabled}
+                disabled={deleteCredential.isPending}
               >
                 {t('credentials.confirmDeleteButton')}
               </Button>
