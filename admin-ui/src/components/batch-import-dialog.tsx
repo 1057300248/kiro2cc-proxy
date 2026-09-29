@@ -13,6 +13,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { KAM_RELEASES_URL } from '@/lib/constants'
 import { extractErrorMessage } from '@/lib/utils'
 import { sha256Hex } from '@/lib/hash'
 
@@ -429,7 +430,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           <Button
             type="button"
             variant="outline"
-            onClick={() => window.open('https://github.com/chaogei/Kiro-account-manager/releases/tag/v1.7.5', '_blank', 'noopener,noreferrer')}
+            onClick={() => window.open(KAM_RELEASES_URL, '_blank', 'noopener,noreferrer')}
           >
             {t('credentials.downloadKamButton')}
           </Button>
