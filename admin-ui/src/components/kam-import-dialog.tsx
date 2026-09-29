@@ -502,24 +502,33 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           )}
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="sm:justify-between">
           <Button
             type="button"
             variant="outline"
-            onClick={() => { onOpenChange(false); resetForm() }}
-            disabled={importing}
+            onClick={() => window.open('https://github.com/chaogei/Kiro-account-manager/releases/tag/v1.7.5', '_blank', 'noopener,noreferrer')}
           >
-            {importing ? t('credentials.importingButton') : results.length > 0 ? t('common.close') : t('common.cancel')}
+            {t('credentials.downloadKamButton')}
           </Button>
-          {results.length === 0 && (
+          <div className="flex flex-col-reverse gap-2 sm:flex-row">
             <Button
               type="button"
-              onClick={handleImport}
-              disabled={importing || !jsonInput.trim() || previewAccounts.length === 0 || !!parseError}
+              variant="outline"
+              onClick={() => { onOpenChange(false); resetForm() }}
+              disabled={importing}
             >
-              {t('credentials.startImportVerifyButton')}
+              {importing ? t('credentials.importingButton') : results.length > 0 ? t('common.close') : t('common.cancel')}
             </Button>
-          )}
+            {results.length === 0 && (
+              <Button
+                type="button"
+                onClick={handleImport}
+                disabled={importing || !jsonInput.trim() || previewAccounts.length === 0 || !!parseError}
+              >
+                {t('credentials.startImportVerifyButton')}
+              </Button>
+            )}
+          </div>
         </DialogFooter>
       </DialogContent>
     </Dialog>
