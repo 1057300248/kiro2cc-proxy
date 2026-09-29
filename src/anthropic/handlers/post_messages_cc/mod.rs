@@ -25,6 +25,13 @@ use super::nonstream::handle_non_stream_request;
 use super::stream::handle_stream_request;
 use crate::anthropic::websearch;
 
+/// /cc/v1/messages 流式响应全局 deadline（秒），防止上游挂起导致请求永不结束
+const CC_STREAM_DEADLINE_SECS: u64 = 300;
+/// prompt cache 模拟：读命中比例
+const CC_CACHE_READ_RATIO: f64 = 0.85;
+/// prompt cache 模拟：creation 创建比例
+const CC_CACHE_CREATION_RATIO: f64 = 0.1;
+
 /// POST /cc/v1/messages
 ///
 /// Claude Code 兼容端点，与 /v1/messages 的区别在于：
@@ -195,8 +202,8 @@ pub async fn post_messages_cc(
     // 计算 prompt cache 模拟 usage
     let prompt_cache_usage = crate::cache::PromptCacheUsage::from_ratio_config(
         input_tokens,
-        crate::cache::CacheSimulationRatioConfig::fixed(0.85),
-        0.1,
+        crate::cache::CacheSimulationRatioConfig::fixed(CC_CACHE_READ_RATIO),
+        CC_CACHE_CREATION_RATIO,
     );
 
     let json_schema_requested = payload
@@ -224,7 +231,7 @@ pub async fn post_messages_cc(
             prompt_cache_usage,
             bound_ids,
             client_ip,
-            Some(Duration::from_secs(300)),
+            Some(Duration::from_secs(CC_STREAM_DEADLINE_SECS)),
             is_compact_request,
             thinking_adaptive_requested,
             bridge_ctx,

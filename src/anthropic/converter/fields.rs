@@ -5,6 +5,13 @@ use crate::anthropic::types::MessagesRequest;
 
 use super::thinking::{additional_fields_skipped, is_gpt_model};
 
+/// claude-opus-5 / claude-opus-4.7 / claude-opus-4.8 Max Output = 128K（1M 窗口代际）
+const MAX_OUTPUT_TOKENS_LARGE_WINDOW: i32 = 128_000;
+/// 标准模型（sonnet 等）Max Output = 64K
+const MAX_OUTPUT_TOKENS_STANDARD: i32 = 64_000;
+/// Kiro 侧 schema 对 max_tokens 的强制最小值（对所有 Claude 代际生效）
+const KIRO_MIN_MAX_TOKENS: i32 = 1_024;
+
 /// 根据模型返回 Kiro 允许的 max_tokens 上限
 /// claude-opus-5 / claude-opus-4.7 / claude-opus-4.8 Max Output = 128K（1M 窗口代际）
 /// claude-sonnet-5 Max Output = 64K，与 sonnet-4.x 同档，走默认分支即可
@@ -18,9 +25,9 @@ pub(super) fn model_max_output_tokens(model: &str) -> i32 {
         || m.contains("opus.5")
         || m.contains("opus 5")
     {
-        128000
+        MAX_OUTPUT_TOKENS_LARGE_WINDOW
     } else {
-        64000
+        MAX_OUTPUT_TOKENS_STANDARD
     }
 }
 
@@ -85,7 +92,7 @@ pub(super) fn build_additional_model_request_fields(
         // （实测：claude-sonnet-4-6 在 max_tokens=200 时同样报 400
         // "Invalid additionalModelRequestFields: must have a minimum value of 1024.0"，
         // 并非只有 opus-4.7/4.8/5 的 128000 上限档才有此限制）。
-        capped = capped.max(1024);
+        capped = capped.max(KIRO_MIN_MAX_TOKENS);
         fields.insert("max_tokens".into(), serde_json::json!(capped));
     }
 

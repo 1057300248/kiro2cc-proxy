@@ -13,14 +13,23 @@ use chrono::{Duration, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+const TOKEN_EXPIRY_LEAD_MINS: i64 = 5;
+const TOKEN_EXPIRING_SOON_MINS: i64 = 10;
+const REFRESH_TOKEN_MIN_LENGTH: usize = 100;
+/// auth/IdC/external_idp token 刷新及 getUsageLimits 请求的 HTTP 超时（秒）
+const KIRO_HTTP_SHORT_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_TOKEN_EXPIRES_IN_SECS: i64 = 3600;
+const AMZ_SDK_REQUEST_SINGLE_ATTEMPT: &str = "attempt=1; max=1";
+const LIST_MODELS_TIMEOUT_SECS: u64 = 15;
+
 /// 检查 Token 是否已过期（提前 5 分钟判断）
 pub(crate) fn is_token_expired(credentials: &KiroCredentials) -> bool {
-    is_token_expiring_within(credentials, 5).unwrap_or(true)
+    is_token_expiring_within(credentials, TOKEN_EXPIRY_LEAD_MINS).unwrap_or(true)
 }
 
 /// 检查 Token 是否即将过期（10分钟内）
 pub(crate) fn is_token_expiring_soon(credentials: &KiroCredentials) -> bool {
-    is_token_expiring_within(credentials, 10).unwrap_or(false)
+    is_token_expiring_within(credentials, TOKEN_EXPIRING_SOON_MINS).unwrap_or(false)
 }
 
 pub(crate) fn sha256_hex(input: &str) -> String {
@@ -48,7 +57,7 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
         .is_some_and(|m| m.eq_ignore_ascii_case("external_idp"));
 
     if !is_external_idp
-        && (refresh_token.len() < 100
+        && (refresh_token.len() < REFRESH_TOKEN_MIN_LENGTH
             || refresh_token.ends_with("...")
             || refresh_token.contains("..."))
     {
@@ -140,7 +149,7 @@ async fn refresh_social_token(
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = &config.kiro_version;
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let client = build_client(proxy, KIRO_HTTP_SHORT_TIMEOUT_SECS, config.tls_backend)?;
     let body = RefreshRequest {
         refresh_token: refresh_token.to_string(),
     };
@@ -257,7 +266,7 @@ async fn refresh_idc_token(
     };
     let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let client = build_client(proxy, KIRO_HTTP_SHORT_TIMEOUT_SECS, config.tls_backend)?;
     let body = IdcRefreshRequest {
         client_id: client_id.to_string(),
         client_secret: client_secret.to_string(),
@@ -362,7 +371,7 @@ async fn refresh_external_idp_token(
         params.push(("scope", scopes_owned.as_str()));
     }
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let client = build_client(proxy, KIRO_HTTP_SHORT_TIMEOUT_SECS, config.tls_backend)?;
     let response = client
         .post(token_endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -402,7 +411,9 @@ async fn refresh_external_idp_token(
         new_credentials.refresh_token = Some(new_rt.to_string());
     }
 
-    let expires_in = data["expires_in"].as_i64().unwrap_or(3600);
+    let expires_in = data["expires_in"]
+        .as_i64()
+        .unwrap_or(DEFAULT_TOKEN_EXPIRES_IN_SECS);
     let expires_at = Utc::now() + Duration::seconds(expires_in);
     new_credentials.expires_at = Some(expires_at.to_rfc3339());
 
@@ -493,7 +504,7 @@ pub(crate) async fn get_usage_limits(
         USAGE_LIMITS_AMZ_USER_AGENT_PREFIX, kiro_version, machine_id
     );
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let client = build_client(proxy, KIRO_HTTP_SHORT_TIMEOUT_SECS, config.tls_backend)?;
 
     // getUsageLimits 是 Q 控制面接口，鉴权需要 SSO portal 的 accessToken；
     // 而传入的 `token` 参数在 IdC 场景下是 credentials.access_token（存放的是 idToken，
@@ -507,7 +518,7 @@ pub(crate) async fn get_usage_limits(
         .header("User-Agent", &user_agent)
         .header("host", &host)
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("amz-sdk-request", AMZ_SDK_REQUEST_SINGLE_ATTEMPT)
         .header("Authorization", format!("Bearer {}", effective_token))
         .header("Connection", "close")
         .send()
@@ -556,7 +567,7 @@ pub(crate) async fn list_available_models(
         body["profileArn"] = serde_json::Value::String(profile_arn.clone());
     }
 
-    let client = build_client(proxy, 15, config.tls_backend)?;
+    let client = build_client(proxy, LIST_MODELS_TIMEOUT_SECS, config.tls_backend)?;
 
     let response = client
         .post(&url)

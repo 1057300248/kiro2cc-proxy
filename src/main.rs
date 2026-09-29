@@ -26,13 +26,15 @@ use model::failure_log::FailureLogStore;
 use model::throttle_log::ThrottleLogStore;
 use model::usage::UsageTracker;
 
+const LOG_CAPTURE_CAPACITY: usize = 1000;
+
 #[tokio::main]
 async fn main() {
     // 解析命令行参数
     let args = Args::parse();
 
     // 初始化日志捕获器（在 tracing 初始化之前创建）
-    let log_capture = std::sync::Arc::new(log_capture::LogCapture::new(1000));
+    let log_capture = std::sync::Arc::new(log_capture::LogCapture::new(LOG_CAPTURE_CAPACITY));
 
     // 初始化日志（registry 风格，同时输出到控制台和 LogCapture）
     {

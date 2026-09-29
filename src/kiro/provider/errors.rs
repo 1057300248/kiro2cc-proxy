@@ -7,12 +7,21 @@ use crate::kiro::model::credentials::{KiroCredentials, fallback_profile_arn_valu
 
 use super::core::KiroProvider;
 
+const THROTTLE_BASE_MS: u64 = 2000;
+const THROTTLE_STEP_MS: u64 = 1000;
+const THROTTLE_MAX_MS: u64 = 8_000;
+const THROTTLE_JITTER_MAX_MS: u64 = 1500;
+const RETRY_BACKOFF_MAX_EXPONENT: usize = 6;
+const RPM_GATE_DEFAULT_WAIT_SECS: u64 = 3;
+const RPM_GATE_MAX_WAIT_SECS: u64 = 5;
+
 impl KiroProvider {
     pub(crate) fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
         const MAX_MS: u64 = 5_000;
-        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
+        let exp = BASE_MS
+            .saturating_mul(2u64.saturating_pow(attempt.min(RETRY_BACKOFF_MAX_EXPONENT) as u32));
         let backoff = exp.min(MAX_MS);
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
@@ -22,9 +31,10 @@ impl KiroProvider {
     /// 429 限流退避：随 attempt 递增，避免固定间隔反复命中同一限流窗口
     pub(crate) fn throttle_delay(attempt: usize) -> Duration {
         // 2s + attempt×1s（上限 8s）+ jitter
-        let base = 2000u64.saturating_add((attempt as u64).saturating_mul(1000));
-        let capped = base.min(8_000);
-        let jitter = fastrand::u64(0..=1500);
+        let base =
+            THROTTLE_BASE_MS.saturating_add((attempt as u64).saturating_mul(THROTTLE_STEP_MS));
+        let capped = base.min(THROTTLE_MAX_MS);
+        let jitter = fastrand::u64(0..=THROTTLE_JITTER_MAX_MS);
         Duration::from_millis(capped.saturating_add(jitter))
     }
 
@@ -43,8 +53,8 @@ impl KiroProvider {
         // 精确计算等待时间
         let wait_duration = rpm
             .time_until_slot(credential_id, max_rpm)
-            .unwrap_or(Duration::from_secs(3))
-            .min(Duration::from_secs(5));
+            .unwrap_or(Duration::from_secs(RPM_GATE_DEFAULT_WAIT_SECS))
+            .min(Duration::from_secs(RPM_GATE_MAX_WAIT_SECS));
 
         tracing::info!(
             "[RPM-GATE] credential={} rpm={} limit={}, waiting {:.1}s{}",

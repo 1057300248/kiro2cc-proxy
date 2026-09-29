@@ -42,16 +42,19 @@ fn default_fingerprint_enabled() -> bool {
     true
 }
 fn default_fingerprint_ttl_5m() -> u64 {
-    300
+    5 * 60
 }
 fn default_fingerprint_ttl_1h() -> u64 {
-    3600
+    60 * 60
 }
 fn default_ephemeral_1h_ratio() -> f64 {
     0.0
 }
+
+const DEFAULT_FINGERPRINT_MAX_BREAKPOINTS: usize = 256;
+
 fn default_fingerprint_max_breakpoints() -> usize {
-    256
+    DEFAULT_FINGERPRINT_MAX_BREAKPOINTS
 }
 
 impl Default for CacheSimulationConfig {
