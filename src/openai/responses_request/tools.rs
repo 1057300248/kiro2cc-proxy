@@ -118,6 +118,17 @@ pub(crate) struct ToolCollector {
 }
 
 impl ToolCollector {
+    /// Return the Kiro-safe name and remember how to restore it for the client.
+    pub(crate) fn alias_name(&mut self, original: &str) -> String {
+        let upstream_name = kiro_tool_name(original);
+        if upstream_name != original {
+            self.tool_name_map
+                .entry(upstream_name.clone())
+                .or_insert_with(|| original.to_string());
+        }
+        upstream_name
+    }
+
     pub(crate) fn push_list(&mut self, list: &[Value], depth: usize) {
         for tool in list {
             self.push_one(tool, depth);
@@ -166,11 +177,9 @@ impl ToolCollector {
         else {
             return;
         };
-        let upstream_name = kiro_tool_name(&original_name);
+        let upstream_name = self.alias_name(&original_name);
         if upstream_name != original_name {
             converted["name"] = json!(upstream_name);
-            self.tool_name_map
-                .insert(upstream_name.clone(), original_name.clone());
         }
         if !self.seen.insert(upstream_name.clone()) {
             tracing::warn!(tool_name = %original_name, "工具重名，保留先出现的声明");

@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::tools::{ToolCollector, ToolInputForm, base64_decode_compaction};
 use crate::openai::chat_request::{
-    MessageAccumulator, convert_image_url, flatten_text, kiro_tool_name, parse_tool_arguments,
+    MessageAccumulator, convert_image_url, flatten_text, parse_tool_arguments,
 };
 
 /// 遍历 `input` 数组，把各类 item 分派到 system 块、消息累加器或工具收集器
@@ -33,12 +33,12 @@ pub(crate) fn convert_input_items(
         match item_type {
             "message" => convert_message_item(item, system, acc),
             "function_call" => {
-                if let Some(block) = tool_use_block(item, ToolInputForm::Json) {
+                if let Some(block) = tool_use_block(item, ToolInputForm::Json, tools) {
                     acc.push("assistant", vec![block]);
                 }
             }
             "custom_tool_call" => {
-                if let Some(block) = tool_use_block(item, ToolInputForm::FreeText) {
+                if let Some(block) = tool_use_block(item, ToolInputForm::FreeText, tools) {
                     acc.push("assistant", vec![block]);
                 }
             }
@@ -155,7 +155,11 @@ fn convert_content_part(part: &Value) -> Option<Value> {
 }
 
 /// `function_call` / `custom_tool_call` → Anthropic `tool_use` block
-fn tool_use_block(item: &Value, form: ToolInputForm) -> Option<Value> {
+fn tool_use_block(
+    item: &Value,
+    form: ToolInputForm,
+    tools: &mut ToolCollector,
+) -> Option<Value> {
     let id = call_id(item)?;
     let name = item
         .get("name")
@@ -181,7 +185,7 @@ fn tool_use_block(item: &Value, form: ToolInputForm) -> Option<Value> {
         }
     };
 
-    let upstream_name = kiro_tool_name(name);
+    let upstream_name = tools.alias_name(name);
     Some(json!({"type": "tool_use", "id": id, "name": upstream_name, "input": input}))
 }
 
