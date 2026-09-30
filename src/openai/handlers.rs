@@ -132,7 +132,14 @@ pub(crate) async fn post_responses(
         Err(response) => return *response,
     };
 
-    let owner_api_key_id = identity.as_ref().map(|context| context.0.id).unwrap_or(0);
+    let Some(owner_api_key_id) = identity.as_ref().map(|context| context.0.id) else {
+        return error::error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_request_error",
+            "Invalid API key.",
+            Some("invalid_api_key"),
+        );
+    };
     let prepared = match state
         .response_store
         .prepare_request(owner_api_key_id, &incoming)

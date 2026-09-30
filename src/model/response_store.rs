@@ -485,6 +485,97 @@ mod tests {
     }
 
     #[test]
+    fn expired_response_cannot_be_resumed() {
+        let store = Arc::new(ResponseStore::new(
+            Duration::ZERO,
+            16,
+            1024 * 1024,
+            256 * 1024,
+        ));
+        save_seed(&store, 7);
+        let err = store
+            .prepare_request(
+                7,
+                &json!({
+                    "model": "gpt-5-codex",
+                    "previous_response_id": "resp_seed",
+                    "input": "second",
+                }),
+            )
+            .err()
+            .expect("expired response must not be resumable");
+        assert!(err.contains("未找到") || err.contains("已过期"));
+    }
+
+    #[test]
+    fn failed_response_is_not_saved() {
+        let store = test_store();
+        let persistence = store
+            .persistence(7, Vec::new(), true)
+            .expect("persistence enabled");
+        persistence.persist(&json!({
+            "id": "resp_failed",
+            "status": "failed",
+            "output": []
+        }));
+        let err = store
+            .prepare_request(
+                7,
+                &json!({
+                    "model": "gpt-5-codex",
+                    "previous_response_id": "resp_failed",
+                    "input": "retry",
+                }),
+            )
+            .err()
+            .expect("failed response must not be stored");
+        assert!(err.contains("未找到"));
+    }
+
+    #[test]
+    fn capacity_evicts_the_oldest_response() {
+        let store = Arc::new(ResponseStore::new(
+            Duration::from_secs(60),
+            1,
+            1024 * 1024,
+            256 * 1024,
+        ));
+        save_seed(&store, 7);
+        let second = store
+            .persistence(7, Vec::new(), true)
+            .expect("persistence enabled");
+        second.persist(&json!({
+            "id": "resp_second",
+            "status": "completed",
+            "output": [{"type": "message", "id": "msg_second", "role": "assistant", "content": []}]
+        }));
+        assert!(
+            store
+                .prepare_request(
+                    7,
+                    &json!({
+                        "model": "gpt-5-codex",
+                        "previous_response_id": "resp_seed",
+                        "input": "old"
+                    }),
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .prepare_request(
+                    7,
+                    &json!({
+                        "model": "gpt-5-codex",
+                        "previous_response_id": "resp_second",
+                        "input": "new"
+                    }),
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn store_defaults_true_and_false_is_honored() {
         let store = test_store();
         let defaulted = store
@@ -499,5 +590,10 @@ mod tests {
             )
             .unwrap();
         assert!(!disabled.store_response);
+        assert!(
+            store
+                .persistence(7, disabled.history, disabled.store_response)
+                .is_none()
+        );
     }
 }
