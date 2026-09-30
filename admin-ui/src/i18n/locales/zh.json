@@ -274,7 +274,7 @@
     "statusFailedNotExcluded": "验活失败（未排除）",
     "statusFailedNotCreated": "验活失败（未创建）",
     "statusSkippedError": "已跳过（error 状态）",
-    "batchImportDialogTitle": "批量导入账号",
+    "batchImportDialogTitle": "KAM批量导入账号",
     "jsonFormatAccountsLabel": "JSON 格式账号",
     "batchImportPlaceholder": "粘贴 JSON 格式的账号（支持单个对象或数组）\n例如: [{\"refreshToken\":\"...\",\"clientId\":\"...\",\"clientSecret\":\"...\",\"authRegion\":\"us-east-1\",\"apiRegion\":\"us-west-2\",\"profileArn\":\"arn:aws:codewhisperer:us-east-1:<account-id>:profile/<profile-id>\"}]\n支持 region 字段自动映射为 authRegion",
     "batchImportHint": "💡 导入时自动验活，失败的账号会被排除",
