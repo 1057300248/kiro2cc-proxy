@@ -482,6 +482,38 @@ mod tests {
     }
 
     #[test]
+    fn truncated_tool_stream_infers_tool_calls_finish_reason() {
+        let mut conv = ChatStreamConverter::new("m", false);
+        let mut frames = conv.on_event("message_start", &json!({}));
+        frames.extend(conv.on_event(
+            "content_block_start",
+            &json!({"index": 1, "content_block": {
+                "type": "tool_use", "id": "t1", "name": "f", "input": {}
+            }}),
+        ));
+        frames.extend(conv.finish());
+        let finish = parse_frame(&frames[frames.len() - 2]).unwrap();
+        assert_eq!(finish["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn message_start_usage_is_used_when_delta_is_missing() {
+        let mut conv = ChatStreamConverter::new("m", true);
+        let mut frames = conv.on_event(
+            "message_start",
+            &json!({"message": {"usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": 4,
+                "cache_creation_input_tokens": 2
+            }}}),
+        );
+        frames.extend(conv.finish());
+        let usage = parse_frame(&frames[frames.len() - 2]).unwrap();
+        assert_eq!(usage["usage"]["prompt_tokens"], 16);
+        assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
+    }
+
+    #[test]
     fn error_after_done_emits_no_second_done() {
         let mut conv = ChatStreamConverter::new("gpt-5.6-terra", false);
         let mut frames = conv.on_event("message_start", &json!({}));

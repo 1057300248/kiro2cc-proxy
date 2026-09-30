@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn truncated_stream_ends_with_response_incomplete() {
-        for reason in ["max_tokens", "model_context_window_exceeded"] {
+        for reason in ["max_tokens"] {
             let frames = run_stream(&[
                 (
                     "content_block_start",
@@ -538,6 +538,26 @@ mod tests {
     }
 
     #[test]
+    fn context_window_exceeded_stream_ends_with_response_failed() {
+        let frames = run_stream(&[
+            ("message_start", json!({})),
+            (
+                "message_delta",
+                json!({"delta": {"stop_reason": "model_context_window_exceeded"}}),
+            ),
+            ("message_stop", json!({})),
+        ]);
+        let names = event_names(&frames);
+        assert_eq!(names.last().unwrap(), "response.failed");
+        let (_, failed) = parse_frame(frames.last().unwrap());
+        assert_eq!(
+            failed["response"]["error"]["code"],
+            json!("context_length_exceeded")
+        );
+        assert!(!names.iter().any(|name| name == "response.completed"));
+    }
+
+    #[test]
     fn upstream_error_event_terminates_without_completed() {
         let mut conv = ResponsesStreamConverter::new("gpt-5.6-terra", HashSet::new());
         let mut frames = conv.on_event("message_start", &json!({"message": {"id": "msg_up"}}));
@@ -551,10 +571,10 @@ mod tests {
         let names = event_names(&frames);
         assert_eq!(
             names,
-            vec!["response.created", "response.in_progress", "error"]
+            vec!["response.created", "response.in_progress", "response.failed"]
         );
         let (_, err) = parse_frame(frames.last().unwrap());
-        assert_eq!(err["message"], json!("上游繁忙"));
+        assert_eq!(err["response"]["error"]["message"], json!("上游繁忙"));
     }
 
     #[test]
@@ -584,7 +604,7 @@ mod tests {
                 .filter(|n| *n == "response.output_item.done")
                 .count(),
         );
-        assert_eq!(names.last().unwrap(), "error");
+        assert_eq!(names.last().unwrap(), "response.failed");
         assert!(!names.iter().any(|n| n == "response.completed"));
         assert!(!names.iter().any(|n| n == "response.incomplete"));
 
@@ -760,23 +780,32 @@ mod tests {
 
     #[test]
     fn max_tokens_stop_reason_yields_incomplete_status() {
-        for reason in ["max_tokens", "model_context_window_exceeded"] {
-            let out = convert_non_stream(
-                &json!({
-                    "content": [{"type": "text", "text": "半句"}],
-                    "stop_reason": reason,
-                }),
-                "gpt-5-codex",
-            );
-            assert_eq!(out["status"], "incomplete", "stop_reason={reason}");
-            assert_eq!(
-                out["incomplete_details"],
-                json!({"reason": "max_output_tokens"}),
-                "stop_reason={reason}"
-            );
-            // 已产出的内容仍要保留
-            assert_eq!(out["output"][0]["content"][0]["text"], "半句");
-        }
+        let out = convert_non_stream(
+            &json!({
+                "content": [{"type": "text", "text": "半句"}],
+                "stop_reason": "max_tokens",
+            }),
+            "gpt-5-codex",
+        );
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(out["incomplete_details"], json!({"reason": "max_output_tokens"}));
+        assert_eq!(out["output"][0]["content"][0]["text"], "半句");
+    }
+
+    #[test]
+    fn context_window_exceeded_has_distinct_nonstream_reason() {
+        let out = convert_non_stream(
+            &json!({
+                "content": [{"type": "text", "text": "半句"}],
+                "stop_reason": "model_context_window_exceeded",
+            }),
+            "gpt-5-codex",
+        );
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(
+            out["incomplete_details"],
+            json!({"reason": "context_window_exceeded"})
+        );
     }
 
     #[test]

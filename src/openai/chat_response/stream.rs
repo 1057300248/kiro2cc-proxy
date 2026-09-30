@@ -34,6 +34,10 @@ pub(crate) struct ChatStreamConverter {
     tool_index_by_block: std::collections::HashMap<i64, usize>,
     next_tool_index: usize,
     finish_reason: &'static str,
+    /// Whether message_delta supplied an authoritative stop_reason.
+    stop_reason_received: bool,
+    /// Whether this stream emitted at least one tool call.
+    saw_tool_call: bool,
     usage: Option<Value>,
 }
 
@@ -50,6 +54,8 @@ impl ChatStreamConverter {
             tool_index_by_block: std::collections::HashMap::new(),
             next_tool_index: 0,
             finish_reason: "stop",
+            stop_reason_received: false,
+            saw_tool_call: false,
             usage: None,
         }
     }
@@ -57,7 +63,14 @@ impl ChatStreamConverter {
     /// 处理一个上游事件，返回待下发的 SSE 帧
     pub(crate) fn on_event(&mut self, name: &str, data: &Value) -> Vec<String> {
         match name {
-            "message_start" => self.ensure_role_frame(),
+            "message_start" => {
+                let frames = self.ensure_role_frame();
+                if self.usage.is_none() {
+                    let baseline = data.get("message").and_then(|message| message.get("usage"));
+                    self.usage = Some(convert_usage(baseline));
+                }
+                frames
+            }
             "content_block_start" => self.on_block_start(data),
             "content_block_delta" => self.on_block_delta(data),
             // 块级收尾在 OpenAI 协议里没有对应事件
@@ -69,6 +82,7 @@ impl ChatStreamConverter {
                     .and_then(Value::as_str)
                 {
                     self.finish_reason = map_finish_reason(Some(reason));
+                    self.stop_reason_received = true;
                 }
                 if let Some(usage) = data.get("usage") {
                     self.usage = Some(convert_usage(Some(usage)));
@@ -95,10 +109,15 @@ impl ChatStreamConverter {
 
         if !self.finish_sent {
             self.finish_sent = true;
+            let finish_reason = if !self.stop_reason_received && self.saw_tool_call {
+                "tool_calls"
+            } else {
+                self.finish_reason
+            };
             frames.push(self.frame(json!([{
                 "index": 0,
                 "delta": {},
-                "finish_reason": self.finish_reason,
+                "finish_reason": finish_reason,
             }])));
         }
 
@@ -163,6 +182,7 @@ impl ChatStreamConverter {
 
         let block_index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
         let tool_index = self.assign_tool_index(block_index);
+        self.saw_tool_call = true;
 
         let mut frames = self.ensure_role_frame();
         frames.push(self.frame(json!([{

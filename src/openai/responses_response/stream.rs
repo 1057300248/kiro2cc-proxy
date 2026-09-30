@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Value, json};
 
 use super::nonstream::{
-    compaction_item, convert_usage, custom_input_from_json_text, is_truncated, new_id,
+    compaction_item, convert_usage, custom_input_from_json_text, is_context_exceeded,
+    is_truncated, new_id,
 };
 
 use crate::model::response_store::ResponsePersistence;
@@ -22,7 +23,7 @@ use super::super::chat_response::{
 // 1. 每个事件的 `sequence_number` 从 0 起严格递增（跨所有事件类型共用一个计数器）
 // 2. 每个 output item 必须成对出现 `response.output_item.added` / `.done`
 // 3. 文本与推理的 `output_index` 不同（它们是两个独立的 output item）
-// 4. 流必须以 `response.completed` 或 `response.incomplete` 收尾，否则客户端会一直等
+// 4. 流必须以 `response.completed` / `response.incomplete` / `response.failed` 收尾
 
 /// 上游一个 content block 只映射一个 part，故 part 序号恒为 0
 const SINGLE_PART_INDEX: i64 = 0;
@@ -64,6 +65,7 @@ pub(crate) struct ResponsesStreamConverter {
     created_sent: bool,
     finished: bool,
     truncated: bool,
+    context_exceeded: bool,
     usage: Option<Value>,
     next_output_index: i64,
     /// Anthropic block index → 打开中的 output item
@@ -91,6 +93,7 @@ impl ResponsesStreamConverter {
             created_sent: false,
             finished: false,
             truncated: false,
+            context_exceeded: false,
             usage: None,
             next_output_index: 0,
             open: HashMap::new(),
@@ -133,6 +136,7 @@ impl ResponsesStreamConverter {
                     .and_then(Value::as_str)
                 {
                     self.truncated = is_truncated(Some(reason));
+                    self.context_exceeded = is_context_exceeded(Some(reason));
                 }
                 if let Some(usage) = data.get("usage") {
                     self.usage = Some(convert_usage(Some(usage)));
@@ -158,6 +162,15 @@ impl ResponsesStreamConverter {
         frames.extend(self.close_all_open());
 
         self.finished = true;
+
+        if self.context_exceeded {
+            frames.push(self.failed_event(
+                "invalid_request_error",
+                Some("context_length_exceeded"),
+                "Conversation context exceeded the model's context window. Compact the conversation or start a new one, then retry.",
+            ));
+            return frames;
+        }
 
         if self.is_compaction {
             return self.finish_compaction(frames);
@@ -265,20 +278,24 @@ impl ResponsesStreamConverter {
             return Vec::new();
         }
         let (message, error_type, code) = super::super::error::extract_stream_error(data);
-        tracing::warn!(error_type = %error_type, "上游流式响应报错，已下发 error 事件并终止");
+        tracing::warn!(error_type = %error_type, "上游流式响应报错，已下发 response.failed 并终止");
 
         let mut frames = self.ensure_created();
         frames.extend(self.close_all_open());
         self.finished = true;
-        frames.push(self.event(
-            "error",
-            json!({
-                "code": code.map(Value::from).unwrap_or(Value::Null),
-                "message": message,
-                "param": Value::Null,
-            }),
-        ));
+        frames.push(self.failed_event(error_type, code, &message));
         frames
+    }
+
+    /// Build the terminal response.failed event understood by Codex Responses clients.
+    fn failed_event(&mut self, error_type: &str, code: Option<&str>, message: &str) -> String {
+        let mut response = self.snapshot("failed");
+        response["error"] = json!({
+            "type": error_type,
+            "code": code.map(Value::from).unwrap_or(Value::Null),
+            "message": message,
+        });
+        self.event("response.failed", json!({"response": response}))
     }
 
     /// 首两个事件（`response.created` + `response.in_progress`）只发一次

@@ -123,7 +123,9 @@ impl ResponseStore {
         let current = normalize_input_items(object.get("input"))?;
         let current = resolve_item_references(
             current,
-            (!previous_history.is_empty()).then_some(previous_history.as_slice()),
+            previous_response_id
+                .as_ref()
+                .map(|_| previous_history.as_slice()),
         )?;
 
         let mut conversion_input = previous_history.clone();
@@ -310,7 +312,7 @@ fn resolve_item_references(
     Ok(resolved)
 }
 
-fn is_history_item(item: &&Value) -> bool {
+fn is_history_item(item: &Value) -> bool {
     history_item_type(item).is_some()
 }
 

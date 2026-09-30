@@ -52,14 +52,14 @@ pub(crate) fn compaction_item(summary_text: &str) -> Value {
 
 /// 上游 `stop_reason` 是否表示输出被截断
 ///
-/// 两种取值都来自 `src/anthropic/handlers.rs`：`max_tokens` 是命中 `max_tokens` 上限，
-/// `model_context_window_exceeded` 是上下文窗口耗尽。对 Responses 客户端而言两者都是
-/// "没写完就停了"，统一映射为 `max_output_tokens`。
+/// 上游 stop_reason 是否表示输出 token 上限导致的截断。
 pub(crate) fn is_truncated(stop_reason: Option<&str>) -> bool {
-    matches!(
-        stop_reason,
-        Some("max_tokens") | Some("model_context_window_exceeded")
-    )
+    matches!(stop_reason, Some("max_tokens"))
+}
+
+/// 上游 stop_reason 是否表示上下文窗口耗尽。
+pub(crate) fn is_context_exceeded(stop_reason: Option<&str>) -> bool {
+    matches!(stop_reason, Some("model_context_window_exceeded"))
 }
 
 /// 把 Anthropic 的 usage 换算为 Responses usage（字段名与 Chat Completions 不同）
@@ -288,6 +288,9 @@ fn convert_non_stream_inner(
     if is_truncated(stop_reason) {
         response["status"] = json!("incomplete");
         response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+    } else if is_context_exceeded(stop_reason) {
+        response["status"] = json!("incomplete");
+        response["incomplete_details"] = json!({"reason": "context_window_exceeded"});
     }
 
     response
