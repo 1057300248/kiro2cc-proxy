@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::tools::{ToolCollector, ToolInputForm, base64_decode_compaction};
 use crate::openai::chat_request::{
-    MessageAccumulator, convert_image_url, flatten_text, parse_tool_arguments,
+    MessageAccumulator, convert_image_url, flatten_text, kiro_tool_name, parse_tool_arguments,
 };
 
 /// 遍历 `input` 数组，把各类 item 分派到 system 块、消息累加器或工具收集器
@@ -181,7 +181,8 @@ fn tool_use_block(item: &Value, form: ToolInputForm) -> Option<Value> {
         }
     };
 
-    Some(json!({"type": "tool_use", "id": id, "name": name, "input": input}))
+    let upstream_name = kiro_tool_name(name);
+    Some(json!({"type": "tool_use", "id": id, "name": upstream_name, "input": input}))
 }
 
 /// `function_call_output` / `custom_tool_call_output` → Anthropic `tool_result` block

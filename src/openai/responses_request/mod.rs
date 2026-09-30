@@ -137,6 +137,7 @@ pub(crate) fn convert(body: &Value) -> Result<ConvertedResponsesRequest, String>
         stream,
         anthropic_body: anthropic,
         custom_tools: tools.custom,
+        tool_name_map: tools.tool_name_map,
         is_compaction,
     })
 }

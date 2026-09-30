@@ -35,6 +35,26 @@ mod tests {
     }
 
     #[test]
+    fn long_tool_names_are_shortened_in_declarations_and_history() {
+        let original = "mcp__codex_apps__codex_document_control___execute_document_command";
+        let r = convert_ok(json!({
+            "model": "gpt-5-codex",
+            "tools": [{"type": "function", "name": original, "parameters": {"type": "object"}}],
+            "input": [
+                {"type": "message", "role": "user", "content": "run"},
+                {"type": "function_call", "call_id": "call_1", "name": original, "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "done"},
+                {"type": "message", "role": "user", "content": "continue"}
+            ]
+        }));
+        let short = r.anthropic_body["tools"][0]["name"].as_str().unwrap();
+        assert!(short.chars().count() <= 64);
+        assert_ne!(short, original);
+        assert_eq!(r.anthropic_body["messages"][1]["content"][0]["name"], short);
+        assert_eq!(r.tool_name_map.get(short).map(String::as_str), Some(original));
+    }
+
+    #[test]
     fn freeform_tool_description_gets_adaptation_note() {
         let r = convert_ok(json!({
             "model": "gpt-5-codex",

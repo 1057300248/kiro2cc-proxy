@@ -1,11 +1,11 @@
 // Copyright (c) 2026 Harllan He. Licensed under MIT.
 //! 工具声明收集与转换：namespace 展开、custom 自由文本工具降级、同名去重
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
-use crate::openai::chat_request::convert_tool;
+use crate::openai::chat_request::{convert_tool, kiro_tool_name};
 
 /// `namespace` 容器的嵌套深度上限；超出即跳过，避免畸形请求把栈递归穿了
 pub(crate) const MAX_NAMESPACE_DEPTH: usize = 4;
@@ -91,6 +91,8 @@ pub(crate) struct ConvertedResponsesRequest {
     /// 声明为 `custom` 的工具名。响应侧必须把这些工具的调用还原成
     /// `custom_tool_call` item（自由文本入参），否则客户端认不出来
     pub(crate) custom_tools: HashSet<String>,
+    /// Kiro 短工具名 -> 客户端原始工具名
+    pub(crate) tool_name_map: HashMap<String, String>,
     /// 是否为 Codex remote compaction v2 压缩请求
     ///
     /// 当 `input` 末尾包含 `{"type":"compaction_trigger"}` 时置为 `true`。
@@ -109,8 +111,10 @@ pub(crate) struct ToolCollector {
     pub(crate) tools: Vec<Value>,
     /// 已收录的工具名，用于同名去重
     seen: HashSet<String>,
-    /// 其中入参为自由文本（`custom`）的工具名
+    /// 其中入参为自由文本（`custom`）的 Kiro 工具名
     pub(crate) custom: HashSet<String>,
+    /// Kiro 短工具名 -> 客户端原始工具名
+    pub(crate) tool_name_map: HashMap<String, String>,
 }
 
 impl ToolCollector {
@@ -152,22 +156,28 @@ impl ToolCollector {
             return;
         }
 
-        let Some(converted) = convert_one_tool(tool) else {
+        let Some(mut converted) = convert_one_tool(tool) else {
             return;
         };
-        let Some(name) = converted
+        let Some(original_name) = converted
             .get("name")
             .and_then(Value::as_str)
             .map(str::to_string)
         else {
             return;
         };
-        if !self.seen.insert(name.clone()) {
-            tracing::warn!(tool_name = %name, "工具重名，保留先出现的声明");
+        let upstream_name = kiro_tool_name(&original_name);
+        if upstream_name != original_name {
+            converted["name"] = json!(upstream_name);
+            self.tool_name_map
+                .insert(upstream_name.clone(), original_name.clone());
+        }
+        if !self.seen.insert(upstream_name.clone()) {
+            tracing::warn!(tool_name = %original_name, "工具重名，保留先出现的声明");
             return;
         }
         if tool_type == "custom" {
-            self.custom.insert(name);
+            self.custom.insert(upstream_name);
         }
         self.tools.push(converted);
     }
