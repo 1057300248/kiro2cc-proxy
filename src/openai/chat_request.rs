@@ -49,14 +49,34 @@ pub(crate) struct ConvertedChatRequest {
 const MAX_KIRO_TOOL_NAME_CHARS: usize = 64;
 const TOOL_NAME_HASH_CHARS: usize = 12;
 
-/// Kiro ToolSpecification.name 最长 64 字符；超长名称使用稳定哈希后缀缩短。
+/// Kiro ToolSpecification.name 最长 64 字符，且只接受 ASCII 字母数字、下划线和连字符。
+/// 不满足约束时生成稳定的安全别名；响应侧再用映射恢复客户端原名。
 pub(super) fn kiro_tool_name(name: &str) -> String {
-    if name.chars().count() <= MAX_KIRO_TOOL_NAME_CHARS {
+    let safe = !name.is_empty()
+        && name.chars().count() <= MAX_KIRO_TOOL_NAME_CHARS
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if safe {
         return name.to_string();
     }
+
     let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
     let prefix_chars = MAX_KIRO_TOOL_NAME_CHARS - TOOL_NAME_HASH_CHARS - 2;
-    let prefix: String = name.chars().take(prefix_chars).collect();
+    let mut prefix: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(prefix_chars)
+        .collect();
+    if prefix.chars().all(|c| c == '_') {
+        prefix = "kiro_tool".to_string();
+    }
     format!("{prefix}__{}", &digest[..TOOL_NAME_HASH_CHARS])
 }
 
@@ -654,6 +674,21 @@ mod tests {
             r.anthropic_body["tools"][0]["input_schema"],
             json!({"type": "object", "properties": {}})
         );
+    }
+
+    #[test]
+    fn invalid_tool_names_are_normalized_stably() {
+        for original in ["namespace.tool:name", "工具.调用", ""] {
+            let a = kiro_tool_name(original);
+            let b = kiro_tool_name(original);
+            assert_eq!(a, b);
+            assert!(!a.is_empty());
+            assert!(a.chars().count() <= MAX_KIRO_TOOL_NAME_CHARS);
+            assert!(
+                a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            );
+        }
     }
 
     #[test]
