@@ -684,7 +684,7 @@ print(resp.choices[0].message.content)
 
 ### 已知限制
 
-- **不支持 `previous_response_id`** —— 代理无状态，不保存历史响应。带该字段的请求直接返回 400 且不产生上游调用；请在 `input` 中回传完整对话历史（Codex CLI 默认即如此，无需额外配置）。
+- **`previous_response_id` 为进程内有状态实现** —— 默认 `store=true` 时按 API Key 隔离保存续接历史，TTL 为 1 小时；`store=false` 不保存。本实现不跨进程/重启持久化，多实例部署时应保持同一会话粘滞到同一实例或后续接入共享存储。
 - **`tool_choice` 仅支持 `auto`** —— 其他取值（`required` / 指定函数名）会记 WARN 后按 `auto` 处理，这是上游 Kiro API 的既有限制。
 - **`reasoning.effort` 对 `gpt-5.6-luna` 无效** —— 该模型上游恒返回 `thinking=0`。
 - **`include: ["reasoning.encrypted_content"]` 被忽略** —— 代理不产出加密 reasoning 内容。

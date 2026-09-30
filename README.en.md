@@ -663,7 +663,7 @@ Model name can be `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-5.6-sol`, or any `clau
 
 ### Known Limitations
 
-- **`previous_response_id` is not supported** — the proxy is stateless and doesn't persist prior responses. Requests containing this field return 400 immediately without an upstream call; send the full conversation history in `input` instead (Codex CLI already does this by default, no extra config needed).
+- **`previous_response_id` uses an in-process state store** — with the default `store=true`, continuation history is isolated by API key and retained for 1 hour; `store=false` disables persistence. State does not survive process restarts or span multiple instances, so multi-instance deployments should keep a conversation sticky to one instance until a shared store is added.
 - **`tool_choice` only supports `auto`** — other values (`required` or a specific function name) are logged as WARN and treated as `auto`; this is an existing limitation of the upstream Kiro API.
 - **`reasoning.effort` has no effect on `gpt-5.6-luna`** — this model always returns `thinking=0` upstream.
 - **`include: ["reasoning.encrypted_content"]` is ignored** — the proxy doesn't produce encrypted reasoning content.

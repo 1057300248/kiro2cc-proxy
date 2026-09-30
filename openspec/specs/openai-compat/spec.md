@@ -129,9 +129,17 @@
 - **WHEN** 请求 `input` 含 `{"type":"custom_tool_call","call_id":"c2","name":"apply_patch","input":"*** Begin Patch"}`
 - **THEN** Anthropic 请求中对应 `tool_use` 的 `input` 为 `{"input":"*** Begin Patch"}`
 
-#### 场景：拒绝有状态请求
-- **WHEN** 请求含非空 `previous_response_id`
-- **THEN** 返回 `400`，body 为 OpenAI 错误结构且 `error.message` 明确指出本端点不支持 `previous_response_id`，且**不**向 Kiro 上游发起任何请求
+#### 场景：previous_response_id 续接
+- **WHEN** 请求含非空 `previous_response_id`，且该响应由当前 API Key 在 TTL 内以 `store=true` 产生
+- **THEN** 代理在触达 Kiro 前恢复此前输入与输出历史，再拼接本轮 `input`；不同 API Key 不得读取彼此的响应历史
+
+#### 场景：store=false
+- **WHEN** Responses 请求显式包含 `store:false`
+- **THEN** 本轮响应不写入 continuation store，后续以其 response id 续接时返回明确的 `400`
+
+#### 场景：item_reference
+- **WHEN** 本轮同时提供有效 `previous_response_id` 与 `{"type":"item_reference","id":"..."}`
+- **THEN** 代理从该 previous response 的历史中解析对应 output item；找不到、已过期或跨 API Key 引用时返回 `400`
 
 #### 场景：忽略 encrypted_content include
 - **WHEN** 请求 `include` 数组含 `"reasoning.encrypted_content"`
@@ -141,9 +149,13 @@
 - **WHEN** 请求含 `max_output_tokens:8000`
 - **THEN** Anthropic 请求的 `max_tokens` 为 `8000`
 
-#### 场景：截断状态映射
-- **WHEN** 上游 `stop_reason` 为 `max_tokens` 或 `model_context_window_exceeded`
-- **THEN** 非流式响应的 `status` 为 `incomplete` 且 `incomplete_details.reason` 为 `max_output_tokens`；流式以 `response.incomplete` 事件收尾而非 `response.completed`
+#### 场景：输出截断状态映射
+- **WHEN** 上游 `stop_reason` 为 `max_tokens`
+- **THEN** 非流式响应的 `status` 为 `incomplete` 且 `incomplete_details.reason` 为 `max_output_tokens`；流式以 `response.incomplete` 收尾
+
+#### 场景：上下文窗口耗尽
+- **WHEN** 上游 `stop_reason` 为 `model_context_window_exceeded`
+- **THEN** 非流式响应返回 `incomplete_details.reason = context_window_exceeded`；流式以 `response.failed` 收尾，`response.error.code = context_length_exceeded`，不得伪装为 `max_output_tokens`
 
 ---
 
