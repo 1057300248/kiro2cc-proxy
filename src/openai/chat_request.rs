@@ -80,6 +80,23 @@ pub(super) fn kiro_tool_name(name: &str) -> String {
     format!("{prefix}__{}", &digest[..TOOL_NAME_HASH_CHARS])
 }
 
+fn register_tool_alias(
+    original: &str,
+    original_to_short: &mut HashMap<String, String>,
+    short_to_original: &mut HashMap<String, String>,
+) -> String {
+    let short = kiro_tool_name(original);
+    if short != original {
+        original_to_short
+            .entry(original.to_string())
+            .or_insert_with(|| short.clone());
+        short_to_original
+            .entry(short.clone())
+            .or_insert_with(|| original.to_string());
+    }
+    short
+}
+
 fn normalize_tool_names(
     tools: &mut [Value],
 ) -> (HashMap<String, String>, HashMap<String, String>) {
@@ -89,11 +106,13 @@ fn normalize_tool_names(
         let Some(original) = tool.get("name").and_then(Value::as_str).map(str::to_string) else {
             continue;
         };
-        let short = kiro_tool_name(&original);
+        let short = register_tool_alias(
+            &original,
+            &mut original_to_short,
+            &mut short_to_original,
+        );
         if short != original {
             tool["name"] = json!(short);
-            original_to_short.insert(original.clone(), short.clone());
-            short_to_original.insert(short, original);
         }
     }
     (original_to_short, short_to_original)
@@ -134,7 +153,23 @@ pub(crate) fn convert(body: &Value) -> Result<ConvertedChatRequest, String> {
         .unwrap_or(DEFAULT_MAX_TOKENS);
 
     let mut converted_tools = convert_tools(body.get("tools")).unwrap_or_default();
-    let (original_to_short, tool_name_map) = normalize_tool_names(&mut converted_tools);
+    let (mut original_to_short, mut tool_name_map) = normalize_tool_names(&mut converted_tools);
+    for message in messages {
+        let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
+            continue;
+        };
+        for call in calls {
+            let Some(name) = call
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            register_tool_alias(name, &mut original_to_short, &mut tool_name_map);
+        }
+    }
 
     let (system, anthropic_messages) = convert_messages(messages, &original_to_short);
     // 入参非空不代表转换后非空：整段全是 system、或每条 content 都为空时会被过滤干净。
@@ -689,6 +724,27 @@ mod tests {
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             );
         }
+    }
+
+    #[test]
+    fn historical_long_tool_name_without_declaration_is_still_restorable() {
+        let original = "mcp__codex_apps__codex_document_control___execute_document_command";
+        let r = convert_ok(json!({
+            "model": "gpt-5-codex",
+            "messages": [
+                {"role": "user", "content": "run"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": original, "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "done"}
+            ]
+        }));
+        let short = r.anthropic_body["messages"][1]["content"][0]["name"]
+            .as_str()
+            .unwrap();
+        assert_ne!(short, original);
+        assert_eq!(r.tool_name_map.get(short).map(String::as_str), Some(original));
     }
 
     #[test]
