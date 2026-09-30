@@ -2,7 +2,7 @@
 #![cfg(test)]
 
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::nonstream::*;
 use super::stream::*;
@@ -682,6 +682,47 @@ mod tests {
             "gpt-5-codex",
         );
         assert_eq!(out["output"][0]["content"][0]["text"], "前半后半");
+    }
+
+    #[test]
+    fn restores_short_tool_name_in_nonstream_response() {
+        let short = "mcp__codex_apps__codex_document_control___exec__123456789abc";
+        let original = "mcp__codex_apps__codex_document_control___execute_document_command";
+        let map = HashMap::from([(short.to_string(), original.to_string())]);
+        let out = super::convert_non_stream_with_tool_name_map(
+            &json!({
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": short, "input": {}}],
+                "stop_reason": "tool_use"
+            }),
+            "gpt-5-codex",
+            &HashSet::new(),
+            &map,
+        );
+        assert_eq!(out["output"][0]["name"], original);
+    }
+
+    #[test]
+    fn restores_short_tool_name_in_stream_response() {
+        let short = "mcp__codex_apps__codex_document_control___exec__123456789abc";
+        let original = "mcp__codex_apps__codex_document_control___execute_document_command";
+        let map = HashMap::from([(short.to_string(), original.to_string())]);
+        let mut conv = ResponsesStreamConverter::new_with_tool_name_map(
+            "gpt-5.6-terra",
+            HashSet::new(),
+            map,
+        );
+        let frames = conv.on_event(
+            "content_block_start",
+            &json!({"index": 0, "content_block": {
+                "type": "tool_use", "id": "toolu_1", "name": short
+            }}),
+        );
+        let parsed = parse_all(&frames);
+        let added = parsed
+            .iter()
+            .find(|(name, _)| name == "response.output_item.added")
+            .expect("应有 output_item.added");
+        assert_eq!(added.1["item"]["name"], original);
     }
 
     #[test]

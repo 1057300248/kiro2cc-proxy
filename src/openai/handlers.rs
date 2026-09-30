@@ -174,6 +174,8 @@ pub(crate) async fn post_responses(
     // custom 工具名要同时供流式与非流式转换使用，各持一份（集合很小，克隆成本可忽略）
     let custom_tools = converted.custom_tools;
     let stream_custom_tools = custom_tools.clone();
+    let tool_name_map = converted.tool_name_map;
+    let stream_tool_name_map = tool_name_map.clone();
     let is_compaction = converted.is_compaction;
     let persistence = state.response_store.persistence(
         owner_api_key_id,
@@ -192,14 +194,16 @@ pub(crate) async fn post_responses(
         client_model,
         move || {
             let converter = if is_compaction {
-                ResponsesStreamConverter::new_compaction(
+                ResponsesStreamConverter::new_compaction_with_tool_name_map(
                     &converter_model,
                     stream_custom_tools,
+                    stream_tool_name_map,
                 )
             } else {
-                ResponsesStreamConverter::new(
+                ResponsesStreamConverter::new_with_tool_name_map(
                     &converter_model,
                     stream_custom_tools,
+                    stream_tool_name_map,
                 )
             };
             let converter = match stream_persistence {
@@ -210,9 +214,19 @@ pub(crate) async fn post_responses(
         },
         move |anthropic, model| {
             let response = if is_compaction {
-                responses_response::convert_non_stream_compaction(anthropic, model, &custom_tools)
+                responses_response::convert_non_stream_compaction_with_tool_name_map(
+                    anthropic,
+                    model,
+                    &custom_tools,
+                    &tool_name_map,
+                )
             } else {
-                responses_response::convert_non_stream(anthropic, model, &custom_tools)
+                responses_response::convert_non_stream_with_tool_name_map(
+                    anthropic,
+                    model,
+                    &custom_tools,
+                    &tool_name_map,
+                )
             };
             if let Some(persistence) = &nonstream_persistence {
                 persistence.persist(&response);
