@@ -4,8 +4,8 @@ mod tests {
         ChatStreamConverter, convert_non_stream, convert_non_stream_with_tool_name_map,
         map_finish_reason,
     };
-    use std::collections::HashMap;
     use serde_json::{Value, json};
+    use std::collections::HashMap;
 
     fn anthropic_text_response() -> Value {
         json!({

@@ -51,7 +51,10 @@ mod tests {
         assert!(short.chars().count() <= 64);
         assert_ne!(short, original);
         assert_eq!(r.anthropic_body["messages"][1]["content"][0]["name"], short);
-        assert_eq!(r.tool_name_map.get(short).map(String::as_str), Some(original));
+        assert_eq!(
+            r.tool_name_map.get(short).map(String::as_str),
+            Some(original)
+        );
     }
 
     #[test]

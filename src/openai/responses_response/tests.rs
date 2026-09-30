@@ -571,7 +571,11 @@ mod tests {
         let names = event_names(&frames);
         assert_eq!(
             names,
-            vec!["response.created", "response.in_progress", "response.failed"]
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.failed"
+            ]
         );
         let (_, err) = parse_frame(frames.last().unwrap());
         assert_eq!(err["response"]["error"]["message"], json!("上游繁忙"));
@@ -706,11 +710,8 @@ mod tests {
         let short = "mcp__codex_apps__codex_document_control___exec__123456789abc";
         let original = "mcp__codex_apps__codex_document_control___execute_document_command";
         let map = HashMap::from([(short.to_string(), original.to_string())]);
-        let mut conv = ResponsesStreamConverter::new_with_tool_name_map(
-            "gpt-5.6-terra",
-            HashSet::new(),
-            map,
-        );
+        let mut conv =
+            ResponsesStreamConverter::new_with_tool_name_map("gpt-5.6-terra", HashSet::new(), map);
         let frames = conv.on_event(
             "content_block_start",
             &json!({"index": 0, "content_block": {
@@ -829,7 +830,10 @@ mod tests {
             "gpt-5-codex",
         );
         assert_eq!(out["status"], "incomplete");
-        assert_eq!(out["incomplete_details"], json!({"reason": "max_output_tokens"}));
+        assert_eq!(
+            out["incomplete_details"],
+            json!({"reason": "max_output_tokens"})
+        );
         assert_eq!(out["output"][0]["content"][0]["text"], "半句");
     }
 

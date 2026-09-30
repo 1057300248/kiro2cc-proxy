@@ -109,11 +109,7 @@ pub(crate) async fn post_chat_completions(
             ))
         },
         move |anthropic, model| {
-            chat_response::convert_non_stream_with_tool_name_map(
-                anthropic,
-                model,
-                &tool_name_map,
-            )
+            chat_response::convert_non_stream_with_tool_name_map(anthropic, model, &tool_name_map)
         },
     )
     .await

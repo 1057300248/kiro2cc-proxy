@@ -155,11 +155,7 @@ fn convert_content_part(part: &Value) -> Option<Value> {
 }
 
 /// `function_call` / `custom_tool_call` → Anthropic `tool_use` block
-fn tool_use_block(
-    item: &Value,
-    form: ToolInputForm,
-    tools: &mut ToolCollector,
-) -> Option<Value> {
+fn tool_use_block(item: &Value, form: ToolInputForm, tools: &mut ToolCollector) -> Option<Value> {
     let id = call_id(item)?;
     let name = item
         .get("name")

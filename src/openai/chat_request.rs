@@ -97,20 +97,14 @@ fn register_tool_alias(
     short
 }
 
-fn normalize_tool_names(
-    tools: &mut [Value],
-) -> (HashMap<String, String>, HashMap<String, String>) {
+fn normalize_tool_names(tools: &mut [Value]) -> (HashMap<String, String>, HashMap<String, String>) {
     let mut original_to_short = HashMap::new();
     let mut short_to_original = HashMap::new();
     for tool in tools {
         let Some(original) = tool.get("name").and_then(Value::as_str).map(str::to_string) else {
             continue;
         };
-        let short = register_tool_alias(
-            &original,
-            &mut original_to_short,
-            &mut short_to_original,
-        );
+        let short = register_tool_alias(&original, &mut original_to_short, &mut short_to_original);
         if short != original {
             tool["name"] = json!(short);
         }
@@ -420,10 +414,7 @@ fn convert_assistant_message(
 }
 
 /// 单个 `tool_calls[]` 项 → Anthropic `tool_use` block
-fn convert_tool_call(
-    call: &Value,
-    original_to_short: &HashMap<String, String>,
-) -> Option<Value> {
+fn convert_tool_call(call: &Value, original_to_short: &HashMap<String, String>) -> Option<Value> {
     let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
     let function = call.get("function")?;
     let name = function.get("name").and_then(Value::as_str)?;
@@ -744,7 +735,10 @@ mod tests {
             .as_str()
             .unwrap();
         assert_ne!(short, original);
-        assert_eq!(r.tool_name_map.get(short).map(String::as_str), Some(original));
+        assert_eq!(
+            r.tool_name_map.get(short).map(String::as_str),
+            Some(original)
+        );
     }
 
     #[test]
@@ -769,7 +763,10 @@ mod tests {
         assert!(short.chars().count() <= MAX_KIRO_TOOL_NAME_CHARS);
         assert_ne!(short, original);
         assert_eq!(r.anthropic_body["messages"][1]["content"][0]["name"], short);
-        assert_eq!(r.tool_name_map.get(short).map(String::as_str), Some(original));
+        assert_eq!(
+            r.tool_name_map.get(short).map(String::as_str),
+            Some(original)
+        );
     }
 
     #[test]

@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Value, json};
 
 use super::nonstream::{
-    compaction_item, convert_usage, custom_input_from_json_text, is_context_exceeded,
-    is_truncated, new_id,
+    compaction_item, convert_usage, custom_input_from_json_text, is_context_exceeded, is_truncated,
+    new_id,
 };
 
 use crate::model::response_store::ResponsePersistence;
@@ -592,11 +592,7 @@ impl ResponsesStreamConverter {
     fn open_tool_call(&mut self, index: i64, call_id: String, name: String) -> Vec<String> {
         let mut frames = self.ensure_created();
         let custom = self.custom_tools.contains(&name);
-        let client_name = self
-            .tool_name_map
-            .get(&name)
-            .cloned()
-            .unwrap_or(name);
+        let client_name = self.tool_name_map.get(&name).cloned().unwrap_or(name);
         let item_id = new_id(if custom { "ctc" } else { "fc" });
         let output_index = self.take_output_index();
         self.open.insert(

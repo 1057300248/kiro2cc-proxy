@@ -47,9 +47,7 @@ pub(crate) fn convert(body: &Value) -> Result<ConvertedResponsesRequest, String>
     if let Some(prev) = body.get("previous_response_id").and_then(Value::as_str)
         && !prev.trim().is_empty()
     {
-        return Err(
-            "previous_response_id 未在进入转换器前解析".to_string(),
-        );
+        return Err("previous_response_id 未在进入转换器前解析".to_string());
     }
 
     let client_model = body
