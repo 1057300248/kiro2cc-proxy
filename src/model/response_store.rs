@@ -28,6 +28,8 @@ struct StoreKey {
 #[derive(Clone, Debug)]
 struct StoredResponse {
     history: Vec<Value>,
+    /// 本响应 output items 在累计 history 中的起始下标。
+    output_start: usize,
     expires_at: Instant,
     size_bytes: usize,
 }
@@ -112,20 +114,24 @@ impl ResponseStore {
             Some(_) => return Err("字段 'store' 必须是 boolean".to_string()),
         };
 
-        let previous_history = if let Some(id) = previous_response_id.as_deref() {
-            self.get_history(owner_api_key_id, id).ok_or_else(|| {
+        let previous = if let Some(id) = previous_response_id.as_deref() {
+            Some(self.get_response(owner_api_key_id, id).ok_or_else(|| {
                 "previous_response_id 未找到、已过期，或不属于当前 API Key".to_string()
-            })?
+            })?)
         } else {
-            Vec::new()
+            None
         };
+        let previous_history = previous
+            .as_ref()
+            .map(|stored| stored.history.clone())
+            .unwrap_or_default();
 
         let current = normalize_input_items(object.get("input"))?;
         let current = resolve_item_references(
             current,
-            previous_response_id
+            previous
                 .as_ref()
-                .map(|_| previous_history.as_slice()),
+                .map(|stored| &stored.history[stored.output_start..]),
         )?;
 
         let mut conversion_input = previous_history.clone();
@@ -158,7 +164,7 @@ impl ResponseStore {
         })
     }
 
-    fn get_history(&self, owner_api_key_id: u32, response_id: &str) -> Option<Vec<Value>> {
+    fn get_response(&self, owner_api_key_id: u32, response_id: &str) -> Option<StoredResponse> {
         let now = Instant::now();
         let mut inner = self.inner.lock();
         prune_expired(&mut inner, now);
@@ -170,7 +176,7 @@ impl ResponseStore {
         let entry = inner.entries.get_mut(&key)?;
         // Active chains remain usable while requests continue to arrive.
         entry.expires_at = now + self.ttl;
-        Some(entry.history.clone())
+        Some(entry.clone())
     }
 
     fn save_response(&self, owner_api_key_id: u32, base_history: &[Value], response: &Value) {
@@ -183,6 +189,7 @@ impl ResponseStore {
         }
 
         let mut history = base_history.to_vec();
+        let output_start = history.len();
         if let Some(output) = response.get("output").and_then(Value::as_array) {
             history.extend(output.iter().filter(|item| is_history_item(item)).cloned());
         }
@@ -238,6 +245,7 @@ impl ResponseStore {
             key,
             StoredResponse {
                 history,
+                output_start,
                 expires_at: now + self.ttl,
                 size_bytes,
             },
@@ -280,7 +288,7 @@ fn normalize_input_items(input: Option<&Value>) -> Result<Vec<Value>, String> {
 
 fn resolve_item_references(
     items: Vec<Value>,
-    previous_history: Option<&[Value]>,
+    previous_output: Option<&[Value]>,
 ) -> Result<Vec<Value>, String> {
     let mut resolved = Vec::with_capacity(items.len());
     for item in items {
@@ -289,7 +297,7 @@ fn resolve_item_references(
             continue;
         }
 
-        let Some(previous_history) = previous_history else {
+        let Some(previous_output) = previous_output else {
             return Err("item_reference requires previous_response_id".to_string());
         };
         let id = item
@@ -298,7 +306,7 @@ fn resolve_item_references(
             .filter(|id| !id.is_empty())
             .ok_or_else(|| "item_reference.id 缺失或为空".to_string())?;
 
-        let referenced = previous_history
+        let referenced = previous_output
             .iter()
             .rev()
             .find(|candidate| {
