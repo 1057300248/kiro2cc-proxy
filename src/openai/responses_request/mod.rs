@@ -15,12 +15,12 @@
 //!
 //! # 无法表达的字段
 //!
-//! - `previous_response_id`：本代理无状态（不存储任何一轮响应），无法按 id 续接上下文。
-//!   非空时直接 400，而不是静默丢弃后返回一个"忘记了前文"的回答。
+//! - `previous_response_id`：由 handler 层的 Responses continuation store 在进入本转换器前解析；
+//!   若仍有非空值到达这里，说明调用方绕过了预处理，继续按 400 拒绝以避免丢上下文。
 //! - `include` 的 `reasoning.encrypted_content`：上游不产出加密推理内容，静默忽略。
 //!   Codex CLI 每轮都会带上它，WARN 会变成刷屏噪声。
-//! - `store` / `parallel_tool_calls` / `temperature` / `top_p` / `text.verbosity` /
-//!   `truncation`：Kiro 上游无对应入参，一并忽略（与 `chat_request` 的处理一致）。
+//! - `store` 由 handler 层 continuation store 消费；`parallel_tool_calls` / `temperature` /
+//!   `top_p` / `text.verbosity` / `truncation`：Kiro 上游无对应入参，一并忽略。
 //! - `tool_choice`：下游管线无读取点，非 `auto` 时 WARN 留痕（既有限制）。
 
 use serde_json::{Value, json};
@@ -43,12 +43,12 @@ use tools::{COMPACTION_SYSTEM_PROMPT, ConvertedResponsesRequest, ToolCollector};
 ///
 /// `Err` 的内容是面向客户端的错误消息（调用方负责包装为 OpenAI 400 错误结构）。
 pub(crate) fn convert(body: &Value) -> Result<ConvertedResponsesRequest, String> {
-    // 有状态请求必须在触达上游前拒绝：继续下去只会拿到缺失前文的错误回答
+    // 正常入口会先在 handler 层解析 continuation；这里保留防御性检查。
     if let Some(prev) = body.get("previous_response_id").and_then(Value::as_str)
         && !prev.trim().is_empty()
     {
         return Err(
-            "不支持 previous_response_id：本代理无状态，请在 input 中回传完整对话历史".to_string(),
+            "previous_response_id 未在进入转换器前解析".to_string(),
         );
     }
 

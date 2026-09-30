@@ -15,6 +15,7 @@ use parking_lot::RwLock;
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 use crate::model::api_key::{ApiKeyAuthResult, ApiKeyManager};
+use crate::model::response_store::ResponseStore;
 use crate::model::rpm::RpmTracker;
 use crate::model::usage::UsageTracker;
 
@@ -57,6 +58,8 @@ pub struct AppState {
     pub fingerprint_tracker: Option<Arc<crate::cache::fingerprint::FingerprintTracker>>,
     /// `/v1/models` 动态列表缓存（TTL 见 `Config::model_cache_ttl_secs`），初始为空
     pub model_cache: Arc<RwLock<Option<CachedModels>>>,
+    /// OpenAI Responses continuation store（按 API Key 隔离）
+    pub(crate) response_store: Arc<ResponseStore>,
 }
 
 impl AppState {
@@ -70,6 +73,7 @@ impl AppState {
             rpm_tracker: None,
             fingerprint_tracker: None,
             model_cache: Arc::new(RwLock::new(None)),
+            response_store: Arc::new(ResponseStore::default()),
         }
     }
 

@@ -8,6 +8,8 @@ use super::nonstream::{
     compaction_item, convert_usage, custom_input_from_json_text, is_truncated, new_id,
 };
 
+use crate::model::response_store::ResponsePersistence;
+
 use super::super::chat_response::{
     INPUT_JSON_DELTA, SIGNATURE_DELTA, TEXT_DELTA, THINKING_DELTA, unix_now,
 };
@@ -70,6 +72,8 @@ pub(crate) struct ResponsesStreamConverter {
     completed_items: Vec<Value>,
     /// 请求侧声明为 `custom` 的工具名
     custom_tools: HashSet<String>,
+    /// 成功/截断终态写入 continuation store；失败终态不保存
+    persistence: Option<ResponsePersistence>,
     /// 是否为 Codex remote compaction v2 请求
     ///
     /// 为 true 时，`finish()` 将把所有文本内容拼合后包装为 `type: "compaction"` output item，
@@ -92,8 +96,15 @@ impl ResponsesStreamConverter {
             open: HashMap::new(),
             completed_items: Vec::new(),
             custom_tools,
+            persistence: None,
             is_compaction: false,
         }
+    }
+
+    /// Attach server-side persistence for previous_response_id continuation.
+    pub(crate) fn with_persistence(mut self, persistence: ResponsePersistence) -> Self {
+        self.persistence = Some(persistence);
+        self
     }
 
     /// 创建压缩模式的流式转换器
@@ -163,6 +174,7 @@ impl ResponsesStreamConverter {
             "response.completed"
         };
         let snapshot = self.snapshot(status);
+        self.persist_snapshot(&snapshot);
         frames.push(self.event(event_name, json!({"response": snapshot})));
         frames
     }
@@ -225,6 +237,7 @@ impl ResponsesStreamConverter {
         ));
 
         let snapshot = self.snapshot("completed");
+        self.persist_snapshot(&snapshot);
         frames.push(self.event("response.completed", json!({"response": snapshot})));
         frames
     }
@@ -747,6 +760,12 @@ impl ResponsesStreamConverter {
         let i = self.next_output_index;
         self.next_output_index += 1;
         i
+    }
+
+    fn persist_snapshot(&self, response: &Value) {
+        if let Some(persistence) = &self.persistence {
+            persistence.persist(response);
+        }
     }
 
     /// `response` 对象快照；`in_progress` 阶段 usage 尚未知，按协议给 `null`

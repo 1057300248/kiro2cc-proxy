@@ -6,6 +6,7 @@ pub mod arg;
 pub mod config;
 pub mod failure_log;
 pub mod geo;
+pub mod response_store;
 pub mod rpm;
 pub mod throttle_log;
 pub mod usage;

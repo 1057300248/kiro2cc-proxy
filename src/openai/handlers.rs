@@ -118,10 +118,26 @@ pub(crate) async fn post_responses(
         Err(response) => return *response,
     };
 
-    let converted = match responses_request::convert(&incoming) {
+    let owner_api_key_id = identity.as_ref().map(|context| context.0.id).unwrap_or(0);
+    let prepared = match state
+        .response_store
+        .prepare_request(owner_api_key_id, &incoming)
+    {
+        Ok(prepared) => prepared,
+        Err(msg) => {
+            return error::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                msg,
+                None,
+            );
+        }
+    };
+
+    let converted = match responses_request::convert(&prepared.body) {
         Ok(c) => c,
         Err(msg) => {
-            // 有状态请求（previous_response_id）在这里就被拒，不产生任何上游请求
+            // 请求转换失败时不触达上游。
             return error::error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -134,6 +150,8 @@ pub(crate) async fn post_responses(
     tracing::info!(
         model = %converted.client_model,
         stream = converted.stream,
+        continued = prepared.continued,
+        store = prepared.store_response,
         "Received POST /v1/responses request"
     );
 
@@ -143,6 +161,13 @@ pub(crate) async fn post_responses(
     let custom_tools = converted.custom_tools;
     let stream_custom_tools = custom_tools.clone();
     let is_compaction = converted.is_compaction;
+    let persistence = state.response_store.persistence(
+        owner_api_key_id,
+        prepared.history,
+        prepared.store_response,
+    );
+    let stream_persistence = persistence.clone();
+    let nonstream_persistence = persistence;
     forward_and_wrap(
         state,
         identity,
@@ -152,24 +177,33 @@ pub(crate) async fn post_responses(
         converted.stream,
         client_model,
         move || {
-            if is_compaction {
-                Box::new(ResponsesStreamConverter::new_compaction(
+            let converter = if is_compaction {
+                ResponsesStreamConverter::new_compaction(
                     &converter_model,
                     stream_custom_tools,
-                ))
+                )
             } else {
-                Box::new(ResponsesStreamConverter::new(
+                ResponsesStreamConverter::new(
                     &converter_model,
                     stream_custom_tools,
-                ))
-            }
+                )
+            };
+            let converter = match stream_persistence {
+                Some(persistence) => converter.with_persistence(persistence),
+                None => converter,
+            };
+            Box::new(converter)
         },
         move |anthropic, model| {
-            if is_compaction {
+            let response = if is_compaction {
                 responses_response::convert_non_stream_compaction(anthropic, model, &custom_tools)
             } else {
                 responses_response::convert_non_stream(anthropic, model, &custom_tools)
+            };
+            if let Some(persistence) = &nonstream_persistence {
+                persistence.persist(&response);
             }
+            response
         },
     )
     .await
