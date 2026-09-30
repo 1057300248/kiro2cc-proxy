@@ -45,6 +45,7 @@ pub(crate) struct ChatStreamConverter {
 }
 
 impl ChatStreamConverter {
+    #[allow(dead_code)] // convenience constructor retained for unit tests
     pub(crate) fn new(client_model: &str, include_usage: bool) -> Self {
         Self::with_tool_name_map(client_model, include_usage, HashMap::new())
     }

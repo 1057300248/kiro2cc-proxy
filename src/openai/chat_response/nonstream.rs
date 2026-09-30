@@ -153,6 +153,7 @@ pub(crate) fn convert_usage(usage: Option<&Value>) -> Value {
 }
 
 /// 把 Anthropic 非流式响应转换为 `chat.completion` 对象
+#[allow(dead_code)] // retained as a stable test/convenience entry point
 pub(crate) fn convert_non_stream(anthropic: &Value, client_model: &str) -> Value {
     convert_non_stream_with_tool_name_map(anthropic, client_model, &HashMap::new())
 }

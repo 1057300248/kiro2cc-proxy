@@ -230,6 +230,7 @@ fn reasoning_item(text: &str) -> Value {
 }
 
 /// 把 Anthropic 非流式响应转换为 Responses `response` 对象
+#[allow(dead_code)] // retained as a stable test/convenience entry point
 pub(crate) fn convert_non_stream(
     anthropic: &Value,
     client_model: &str,
@@ -251,6 +252,7 @@ pub(crate) fn convert_non_stream_with_tool_name_map(
 ///
 /// 当 `is_compaction=true` 时，将模型返回的文本内容包装为 `type: "compaction"` output item，
 /// 满足 Codex remote compaction v2 的协议要求（恰好一个 compaction output item）。
+#[allow(dead_code)] // retained as a stable test/convenience entry point
 pub(crate) fn convert_non_stream_compaction(
     anthropic: &Value,
     client_model: &str,

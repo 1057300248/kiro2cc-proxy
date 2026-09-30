@@ -86,6 +86,7 @@ pub(crate) struct ResponsesStreamConverter {
 }
 
 impl ResponsesStreamConverter {
+    #[allow(dead_code)] // convenience constructor retained for unit tests
     pub(crate) fn new(client_model: &str, custom_tools: HashSet<String>) -> Self {
         Self::new_with_tool_name_map(client_model, custom_tools, HashMap::new())
     }
@@ -124,6 +125,7 @@ impl ResponsesStreamConverter {
     /// 创建压缩模式的流式转换器
     ///
     /// 在 `finish()` 时将文本响应包装为 `type: "compaction"` output item 而非普通 message item。
+    #[allow(dead_code)] // convenience constructor retained for unit tests
     pub(crate) fn new_compaction(client_model: &str, custom_tools: HashSet<String>) -> Self {
         Self::new_compaction_with_tool_name_map(client_model, custom_tools, HashMap::new())
     }

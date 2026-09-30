@@ -16,6 +16,7 @@ mod tests;
 pub(crate) use nonstream::map_finish_reason;
 #[allow(unused_imports)] // 跨模块测试（responses_response）引用
 pub(super) use nonstream::unix_now;
+#[allow(unused_imports)] // legacy helper retained for unit tests
 pub(crate) use nonstream::{convert_non_stream, convert_non_stream_with_tool_name_map};
 pub(crate) use stream::ChatStreamConverter;
 pub(super) use stream::{INPUT_JSON_DELTA, SIGNATURE_DELTA, TEXT_DELTA, THINKING_DELTA};

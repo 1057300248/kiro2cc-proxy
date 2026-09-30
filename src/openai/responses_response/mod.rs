@@ -13,6 +13,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
+#[allow(unused_imports)] // convenience helpers retained for unit tests
 pub(crate) use nonstream::{
     convert_non_stream, convert_non_stream_compaction,
     convert_non_stream_compaction_with_tool_name_map, convert_non_stream_with_tool_name_map,
