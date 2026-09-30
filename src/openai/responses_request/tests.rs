@@ -1,14 +1,68 @@
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use crate::model::response_store::ResponseStore;
     use crate::openai::chat_request::DEFAULT_MAX_TOKENS;
     use crate::openai::responses_request::tools::{
         DEFAULT_TOOL_NAMESPACE, FREEFORM_ADAPTATION_NOTE, MAX_NAMESPACE_DEPTH, custom_tool_schema,
     };
     use crate::openai::responses_request::{ConvertedResponsesRequest, convert};
+    use crate::openai::responses_response::convert_non_stream_with_tool_name_map;
     use serde_json::{Value, json};
 
     fn convert_ok(body: Value) -> ConvertedResponsesRequest {
         convert(&body).expect("转换应成功")
+    }
+
+    #[test]
+    fn stateful_response_round_trip_replays_output_into_next_request() {
+        let store = Arc::new(ResponseStore::default());
+        let first = store
+            .prepare_request(
+                42,
+                &json!({"model": "gpt-5-codex", "input": "first question"}),
+            )
+            .unwrap();
+        let response = convert_non_stream_with_tool_name_map(
+            &json!({
+                "id": "msg_upstream",
+                "content": [{"type": "text", "text": "first answer"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 2}
+            }),
+            "gpt-5-codex",
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+        let response_id = response["id"].as_str().unwrap().to_string();
+        let output_item_id = response["output"][0]["id"].as_str().unwrap().to_string();
+        store
+            .persistence(42, first.history, true)
+            .unwrap()
+            .persist(&response);
+
+        let next = store
+            .prepare_request(
+                42,
+                &json!({
+                    "model": "gpt-5-codex",
+                    "previous_response_id": response_id,
+                    "input": [
+                        {"type": "item_reference", "id": output_item_id},
+                        {"type": "message", "role": "user", "content": "second question"}
+                    ]
+                }),
+            )
+            .unwrap();
+        let converted = convert(&next.body).unwrap();
+        let messages = converted.anthropic_body["messages"].as_array().unwrap();
+        assert!(messages.iter().any(|message| {
+            message["role"] == "assistant" && message["content"][0]["text"] == "first answer"
+        }));
+        assert!(messages.iter().any(|message| {
+            message["role"] == "user" && message["content"][0]["text"] == "second question"
+        }));
     }
 
     #[test]
