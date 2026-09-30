@@ -98,7 +98,7 @@ impl ChatStreamConverter {
                     self.stop_reason_received = true;
                 }
                 if let Some(usage) = data.get("usage") {
-                    self.usage = Some(convert_usage(Some(usage)));
+                    self.update_usage(usage);
                 }
                 Vec::new()
             }
@@ -108,6 +108,30 @@ impl ChatStreamConverter {
                 tracing::warn!(event = %other, "未识别的上游 SSE 事件，已跳过");
                 Vec::new()
             }
+        }
+    }
+
+    /// Merge a possibly partial `message_delta.usage` into the message-start baseline.
+    /// Some upstream paths report only output tokens in the delta.
+    fn update_usage(&mut self, usage: &Value) {
+        let has_input = [
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ]
+        .iter()
+        .any(|key| usage.get(*key).and_then(Value::as_i64).is_some());
+        let incoming = convert_usage(Some(usage));
+        if has_input || self.usage.is_none() {
+            self.usage = Some(incoming);
+            return;
+        }
+
+        if let Some(current) = self.usage.as_mut() {
+            current["completion_tokens"] = incoming["completion_tokens"].clone();
+            let prompt = current["prompt_tokens"].as_i64().unwrap_or_default();
+            let completion = current["completion_tokens"].as_i64().unwrap_or_default();
+            current["total_tokens"] = json!(prompt + completion);
         }
     }
 

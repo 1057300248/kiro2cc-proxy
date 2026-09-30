@@ -551,6 +551,21 @@ mod tests {
     }
 
     #[test]
+    fn partial_delta_usage_preserves_message_start_input_tokens() {
+        let mut conv = ChatStreamConverter::new("m", true);
+        conv.on_event(
+            "message_start",
+            &json!({"message": {"usage": {"input_tokens": 10}}}),
+        );
+        conv.on_event("message_delta", &json!({"usage": {"output_tokens": 3}}));
+        let frames = conv.finish();
+        let usage = parse_frame(&frames[frames.len() - 2]).unwrap()["usage"].clone();
+        assert_eq!(usage["prompt_tokens"], 10);
+        assert_eq!(usage["completion_tokens"], 3);
+        assert_eq!(usage["total_tokens"], 13);
+    }
+
+    #[test]
     fn error_after_done_emits_no_second_done() {
         let mut conv = ChatStreamConverter::new("gpt-5.6-terra", false);
         let mut frames = conv.on_event("message_start", &json!({}));

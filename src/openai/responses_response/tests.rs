@@ -150,6 +150,23 @@ mod tests {
     }
 
     #[test]
+    fn partial_delta_usage_preserves_message_start_input_tokens() {
+        let frames = run_stream(&[
+            (
+                "message_start",
+                json!({"message": {"usage": {"input_tokens": 10}}}),
+            ),
+            ("message_delta", json!({"usage": {"output_tokens": 3}})),
+            ("message_stop", json!({})),
+        ]);
+        let (_, completed) = parse_frame(frames.last().unwrap());
+        let usage = &completed["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 10);
+        assert_eq!(usage["output_tokens"], 3);
+        assert_eq!(usage["total_tokens"], 13);
+    }
+
+    #[test]
     fn empty_text_block_produces_no_output_item() {
         // 上游在工具调用前会先发一个空 text 块，不能因此给客户端塞空 message item
         let frames = run_stream(&[

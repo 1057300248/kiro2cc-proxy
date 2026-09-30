@@ -146,7 +146,14 @@ impl ResponsesStreamConverter {
         let is_compaction = self.is_compaction;
         let pass = |f: Vec<String>| if is_compaction { Vec::new() } else { f };
         match name {
-            "message_start" => self.ensure_created(),
+            "message_start" => {
+                let frames = self.ensure_created();
+                if self.usage.is_none() {
+                    let baseline = data.get("message").and_then(|message| message.get("usage"));
+                    self.usage = Some(convert_usage(baseline));
+                }
+                frames
+            }
             "content_block_start" => pass(self.on_block_start(data)),
             "content_block_delta" => pass(self.on_block_delta(data)),
             "content_block_stop" => pass(self.close_item(block_index(data))),
@@ -160,7 +167,7 @@ impl ResponsesStreamConverter {
                     self.context_exceeded = is_context_exceeded(Some(reason));
                 }
                 if let Some(usage) = data.get("usage") {
-                    self.usage = Some(convert_usage(Some(usage)));
+                    self.update_usage(usage);
                 }
                 Vec::new()
             }
@@ -170,6 +177,30 @@ impl ResponsesStreamConverter {
                 tracing::warn!(event = %other, "未识别的上游 SSE 事件，已跳过");
                 Vec::new()
             }
+        }
+    }
+
+    /// Merge a possibly partial `message_delta.usage` into the message-start baseline.
+    /// Some upstream paths report only output tokens in the delta.
+    fn update_usage(&mut self, usage: &Value) {
+        let has_input = [
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ]
+        .iter()
+        .any(|key| usage.get(*key).and_then(Value::as_i64).is_some());
+        let incoming = convert_usage(Some(usage));
+        if has_input || self.usage.is_none() {
+            self.usage = Some(incoming);
+            return;
+        }
+
+        if let Some(current) = self.usage.as_mut() {
+            current["output_tokens"] = incoming["output_tokens"].clone();
+            let input = current["input_tokens"].as_i64().unwrap_or_default();
+            let output = current["output_tokens"].as_i64().unwrap_or_default();
+            current["total_tokens"] = json!(input + output);
         }
     }
 
