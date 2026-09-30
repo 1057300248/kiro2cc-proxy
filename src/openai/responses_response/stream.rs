@@ -72,8 +72,10 @@ pub(crate) struct ResponsesStreamConverter {
     open: HashMap<i64, OpenItem>,
     /// 已收尾的 output item，用于 `response.completed` 的快照
     completed_items: Vec<Value>,
-    /// 请求侧声明为 `custom` 的工具名
+    /// 请求侧声明为 `custom` 的 Kiro 工具名
     custom_tools: HashSet<String>,
+    /// Kiro 短工具名 -> 客户端原始工具名
+    tool_name_map: HashMap<String, String>,
     /// 成功/截断终态写入 continuation store；失败终态不保存
     persistence: Option<ResponsePersistence>,
     /// 是否为 Codex remote compaction v2 请求
@@ -85,6 +87,14 @@ pub(crate) struct ResponsesStreamConverter {
 
 impl ResponsesStreamConverter {
     pub(crate) fn new(client_model: &str, custom_tools: HashSet<String>) -> Self {
+        Self::new_with_tool_name_map(client_model, custom_tools, HashMap::new())
+    }
+
+    pub(crate) fn new_with_tool_name_map(
+        client_model: &str,
+        custom_tools: HashSet<String>,
+        tool_name_map: HashMap<String, String>,
+    ) -> Self {
         Self {
             id: new_id("resp"),
             created_at: unix_now(),
@@ -99,6 +109,7 @@ impl ResponsesStreamConverter {
             open: HashMap::new(),
             completed_items: Vec::new(),
             custom_tools,
+            tool_name_map,
             persistence: None,
             is_compaction: false,
         }
@@ -114,7 +125,15 @@ impl ResponsesStreamConverter {
     ///
     /// 在 `finish()` 时将文本响应包装为 `type: "compaction"` output item 而非普通 message item。
     pub(crate) fn new_compaction(client_model: &str, custom_tools: HashSet<String>) -> Self {
-        let mut conv = Self::new(client_model, custom_tools);
+        Self::new_compaction_with_tool_name_map(client_model, custom_tools, HashMap::new())
+    }
+
+    pub(crate) fn new_compaction_with_tool_name_map(
+        client_model: &str,
+        custom_tools: HashSet<String>,
+        tool_name_map: HashMap<String, String>,
+    ) -> Self {
+        let mut conv = Self::new_with_tool_name_map(client_model, custom_tools, tool_name_map);
         conv.is_compaction = true;
         conv
     }
@@ -573,6 +592,11 @@ impl ResponsesStreamConverter {
     fn open_tool_call(&mut self, index: i64, call_id: String, name: String) -> Vec<String> {
         let mut frames = self.ensure_created();
         let custom = self.custom_tools.contains(&name);
+        let client_name = self
+            .tool_name_map
+            .get(&name)
+            .cloned()
+            .unwrap_or(name);
         let item_id = new_id(if custom { "ctc" } else { "fc" });
         let output_index = self.take_output_index();
         self.open.insert(
@@ -582,7 +606,7 @@ impl ResponsesStreamConverter {
                 item_id: item_id.clone(),
                 kind: OpenKind::ToolCall {
                     call_id: call_id.clone(),
-                    name: name.clone(),
+                    name: client_name.clone(),
                     custom,
                 },
                 buffer: String::new(),
@@ -594,7 +618,7 @@ impl ResponsesStreamConverter {
                 "type": "custom_tool_call",
                 "id": item_id,
                 "call_id": call_id,
-                "name": name,
+                "name": client_name,
                 "input": "",
                 "status": "in_progress",
             })
@@ -603,7 +627,7 @@ impl ResponsesStreamConverter {
                 "type": "function_call",
                 "id": item_id,
                 "call_id": call_id,
-                "name": name,
+                "name": client_name,
                 "arguments": "",
                 "status": "in_progress",
             })

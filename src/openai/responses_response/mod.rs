@@ -13,5 +13,8 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use nonstream::{convert_non_stream, convert_non_stream_compaction};
+pub(crate) use nonstream::{
+    convert_non_stream, convert_non_stream_compaction,
+    convert_non_stream_compaction_with_tool_name_map, convert_non_stream_with_tool_name_map,
+};
 pub(crate) use stream::ResponsesStreamConverter;
