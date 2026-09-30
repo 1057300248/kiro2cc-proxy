@@ -1,8 +1,10 @@
 #[cfg(test)]
 mod tests {
     use crate::openai::chat_response::{
-        ChatStreamConverter, convert_non_stream, map_finish_reason,
+        ChatStreamConverter, convert_non_stream, convert_non_stream_with_tool_name_map,
+        map_finish_reason,
     };
+    use std::collections::HashMap;
     use serde_json::{Value, json};
 
     fn anthropic_text_response() -> Value {
@@ -84,6 +86,41 @@ mod tests {
             serde_json::from_str::<Value>(args).unwrap(),
             json!({"city": "SH"})
         );
+    }
+
+    #[test]
+    fn restores_short_tool_name_in_non_stream_response() {
+        let short = "mcp__codex_apps__codex_document_control___exec__123456789abc";
+        let original = "mcp__codex_apps__codex_document_control___execute_document_command";
+        let map = HashMap::from([(short.to_string(), original.to_string())]);
+        let out = convert_non_stream_with_tool_name_map(
+            &json!({
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": short, "input": {}}],
+                "stop_reason": "tool_use"
+            }),
+            "m",
+            &map,
+        );
+        assert_eq!(
+            out["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            original
+        );
+    }
+
+    #[test]
+    fn restores_short_tool_name_in_stream_response() {
+        let short = "mcp__codex_apps__codex_document_control___exec__123456789abc";
+        let original = "mcp__codex_apps__codex_document_control___execute_document_command";
+        let map = HashMap::from([(short.to_string(), original.to_string())]);
+        let mut conv = ChatStreamConverter::with_tool_name_map("m", false, map);
+        let frames = conv.on_event(
+            "content_block_start",
+            &json!({"index": 0, "content_block": {
+                "type": "tool_use", "id": "toolu_1", "name": short
+            }}),
+        );
+        assert!(frames.iter().any(|frame| frame.contains(original)));
+        assert!(!frames.iter().any(|frame| frame.contains(short)));
     }
 
     #[test]

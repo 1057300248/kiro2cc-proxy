@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Harllan He. Licensed under MIT.
 //! 流式部分：Anthropic SSE → OpenAI `chat.completion.chunk` SSE 转换状态机
 
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
 
 use super::nonstream::{convert_usage, map_finish_reason, new_completion_id, unix_now};
@@ -39,10 +41,19 @@ pub(crate) struct ChatStreamConverter {
     /// Whether this stream emitted at least one tool call.
     saw_tool_call: bool,
     usage: Option<Value>,
+    tool_name_map: HashMap<String, String>,
 }
 
 impl ChatStreamConverter {
     pub(crate) fn new(client_model: &str, include_usage: bool) -> Self {
+        Self::with_tool_name_map(client_model, include_usage, HashMap::new())
+    }
+
+    pub(crate) fn with_tool_name_map(
+        client_model: &str,
+        include_usage: bool,
+        tool_name_map: HashMap<String, String>,
+    ) -> Self {
         Self {
             id: new_completion_id(),
             created: unix_now(),
@@ -57,6 +68,7 @@ impl ChatStreamConverter {
             stop_reason_received: false,
             saw_tool_call: false,
             usage: None,
+            tool_name_map,
         }
     }
 
@@ -180,6 +192,11 @@ impl ChatStreamConverter {
             return Vec::new();
         };
 
+        let client_name = self
+            .tool_name_map
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
         let block_index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
         let tool_index = self.assign_tool_index(block_index);
         self.saw_tool_call = true;
@@ -191,7 +208,7 @@ impl ChatStreamConverter {
                 "index": tool_index,
                 "id": id,
                 "type": "function",
-                "function": {"name": name, "arguments": ""},
+                "function": {"name": client_name, "arguments": ""},
             }]},
             "finish_reason": Value::Null,
         }])));

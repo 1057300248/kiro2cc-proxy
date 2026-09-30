@@ -90,6 +90,8 @@ pub(crate) async fn post_chat_completions(
 
     let client_model = converted.client_model;
     let include_usage = converted.include_usage;
+    let tool_name_map = converted.tool_name_map;
+    let stream_tool_name_map = tool_name_map.clone();
     let converter_model = client_model.clone();
     forward_and_wrap(
         state,
@@ -99,8 +101,20 @@ pub(crate) async fn post_chat_completions(
         converted.anthropic_body,
         converted.stream,
         client_model,
-        move || Box::new(ChatStreamConverter::new(&converter_model, include_usage)),
-        chat_response::convert_non_stream,
+        move || {
+            Box::new(ChatStreamConverter::with_tool_name_map(
+                &converter_model,
+                include_usage,
+                stream_tool_name_map,
+            ))
+        },
+        move |anthropic, model| {
+            chat_response::convert_non_stream_with_tool_name_map(
+                anthropic,
+                model,
+                &tool_name_map,
+            )
+        },
     )
     .await
 }

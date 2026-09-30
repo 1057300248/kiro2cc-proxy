@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Harllan He. Licensed under MIT.
 //! 非流式部分：Anthropic Messages 响应 → `chat.completion` 对象
 
+use std::collections::HashMap;
+
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -47,7 +49,10 @@ struct ExtractedContent {
 /// `thinking` 块的 `signature` 字段是为通过下游检测伪造的无语义串
 /// （`src/anthropic/stream.rs` 的 `generate_fake_signature`），只取 `thinking` 文本，
 /// 绝不把签名混进任何面向客户端的字段。
-fn extract_content(content: Option<&Value>) -> ExtractedContent {
+fn extract_content(
+    content: Option<&Value>,
+    tool_name_map: &HashMap<String, String>,
+) -> ExtractedContent {
     let mut out = ExtractedContent::default();
     let Some(blocks) = content.and_then(Value::as_array) else {
         return out;
@@ -71,7 +76,7 @@ fn extract_content(content: Option<&Value>) -> ExtractedContent {
             }
             "tool_use" => {
                 let index = out.tool_calls.len();
-                if let Some(call) = tool_use_to_call(block, index) {
+                if let Some(call) = tool_use_to_call(block, index, tool_name_map) {
                     out.tool_calls.push(call);
                 }
             }
@@ -90,7 +95,11 @@ fn extract_content(content: Option<&Value>) -> ExtractedContent {
 ///
 /// 缺 `id` 或 `name` 的块无法构造合法 `tool_calls` 项，只能跳过；但必须留痕，否则客户端
 /// 收到的响应会莫名少一次工具调用而无从排查。
-fn tool_use_to_call(block: &Value, index: usize) -> Option<Value> {
+fn tool_use_to_call(
+    block: &Value,
+    index: usize,
+    tool_name_map: &HashMap<String, String>,
+) -> Option<Value> {
     let id = block.get("id").and_then(Value::as_str);
     let name = block.get("name").and_then(Value::as_str);
     let (Some(id), Some(name)) = (id, name) else {
@@ -101,6 +110,7 @@ fn tool_use_to_call(block: &Value, index: usize) -> Option<Value> {
         );
         return None;
     };
+    let name = tool_name_map.get(name).map(String::as_str).unwrap_or(name);
     // OpenAI 的 arguments 是 JSON 字符串，不是对象
     let arguments = block
         .get("input")
@@ -144,7 +154,15 @@ pub(crate) fn convert_usage(usage: Option<&Value>) -> Value {
 
 /// 把 Anthropic 非流式响应转换为 `chat.completion` 对象
 pub(crate) fn convert_non_stream(anthropic: &Value, client_model: &str) -> Value {
-    let extracted = extract_content(anthropic.get("content"));
+    convert_non_stream_with_tool_name_map(anthropic, client_model, &HashMap::new())
+}
+
+pub(crate) fn convert_non_stream_with_tool_name_map(
+    anthropic: &Value,
+    client_model: &str,
+    tool_name_map: &HashMap<String, String>,
+) -> Value {
+    let extracted = extract_content(anthropic.get("content"), tool_name_map);
     let stop_reason = anthropic.get("stop_reason").and_then(Value::as_str);
     let finish_reason = map_finish_reason(stop_reason);
 

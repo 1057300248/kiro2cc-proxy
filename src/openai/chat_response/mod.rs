@@ -12,7 +12,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use nonstream::convert_non_stream;
+pub(crate) use nonstream::{convert_non_stream, convert_non_stream_with_tool_name_map};
 #[allow(unused_imports)] // 测试引用
 pub(crate) use nonstream::map_finish_reason;
 #[allow(unused_imports)] // 跨模块测试（responses_response）引用
