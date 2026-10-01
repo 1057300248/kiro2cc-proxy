@@ -1,0 +1,49 @@
+name: Stateful Responses Review
+
+on:
+  push:
+    branches: ['codex/stateful-responses-20260930']
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'Cargo.*'
+      - '.github/workflows/stateful-review.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stateful-review-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: Build embedded UIs
+        run: |
+          (cd admin-ui && pnpm install && pnpm build)
+          (cd user-ui && npm install && npm run build)
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Type check
+        run: cargo check --locked --all-targets
+      - name: Clippy
+        run: cargo clippy --locked --all-targets
+      - name: Regression tests
+        run: cargo test --locked
+      - name: Release build
+        run: cargo build --release --locked
