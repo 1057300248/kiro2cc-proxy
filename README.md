@@ -685,29 +685,33 @@ print(resp.choices[0].message.content)
 
 ### 通过 new-api 反代并共享上游 Key
 
-Kiro 配置写在本服务的 `config.json`（或环境变量 `RESPONSE_STORE_TENANT_HEADER`），不是 new-api 的请求体覆盖：
+**New API 不需要改源码或合入专用 PR。**只使用已有的渠道 Header Override；身份规范化、HMAC 与续接隔离全部在 Kiro 内完成。
+
+在 Kiro 的 `config.json` 设置（移除旧 `responseStoreTenantHeader`，两种模式不能并用）：
 
 ```json
-{"responseStoreTenantHeader":"X-Kiro2CC-Tenant"}
+{"responseStoreClientAuthorizationHeader":"X-Kiro2CC-Client-Authorization"}
 ```
 
-使用配套的 new-api 已认证租户补丁后，渠道 **Header Override** 设置为：
+设置 Kiro 环境变量 `RESPONSE_STORE_HMAC_KEY` 为随机生成并妥善保存的 **64 位十六进制字符串**（32 字节），例如在服务器执行 `openssl rand -hex 32` 后通过密钥管理或受保护的环境文件注入。不要提交密钥到仓库。头名称也可用 `RESPONSE_STORE_CLIENT_AUTHORIZATION_HEADER` 配置；空值、无效头、缺失/非法密钥或双模式会拒绝启动，不降级到共享范围。
+
+在 New API 的 Kiro 渠道中，Header Override 使用下面的明确配置：
 
 ```json
-{"X-Kiro2CC-Tenant":"{authenticated_tenant}"}
+{"X-Kiro2CC-Client-Authorization":"{client_header:Authorization}"}
 ```
 
-该占位符由 new-api 鉴权成功后的用户 ID / Token ID 派生不透明 HMAC 标识；不是原始请求头。不同 token 互相隔离，同一个已认证 token 的不同请求头格式保持同一范围。渠道密钥轮换会改变范围，需新建会话或回传完整历史。不要以 `{client_header:Authorization}`、`{client_header:x-api-key}` 或任意客户端租户头充当所有者边界。
+正常上游 `Authorization` 仍由渠道设置生成，使用 Kiro 网关 Key。不要覆盖它，也不要把 `{api_key}` 当作客户凭据。**禁止该内部头的通配、正则、pass_headers 或动态参数覆盖透传**，因为源 Authorization 缺失时旧网关会跳过显式覆盖；推荐此渠道的整个头覆盖仅使用上述一项。清除旧 `X-Kiro2CC-Tenant`/`{authenticated_tenant}` 配置，无需合入 New API PR #12。
 
-配套变更位于 `1057300248/wanchuan-new-api` 的 `codex/kiro-authenticated-tenant-20261001` 分支；未合入该补丁的 new-api 不能把这个占位符作为字面量转发。正常上游 Authorization 仍使用 Kiro 渠道密钥。渠道自检使用单独命名空间。
+只支持经核对的标准 New API Authorization 子集：`Bearer`/`bearer` 或裸 Key，可带 `sk-`，基础 Key 为 32–128 位 ASCII 字母数字且区分大小写。保留该路径实际完成鉴权的前提；`midjourney-proxy`/`mj-api-secret` 备用鉴权、渠道选择后缀、特殊路由转换不猜测支持。不通过 `user`、IP、body metadata 或任意租户头补全身份。
 
-Base URL 使用实际可达的 Kiro 服务地址与监听端口，不追加 `/v1`；`5678` 只是历史示例，不是程序默认端口。保持 `disable_store` 关闭，要续接的轮次使用 `store=true`。Kiro 必须仅对可信网关/私网开放；跨主机使用受保护传输。租户头只是状态命名空间，不替代认证，也不是逐请求签名。
+有状态请求（默认 `store=true`）和任何续接均需要有效客户身份。缺失头时只允许明确 `store=false`、无 previous_response_id/item_reference 的无状态请求；渠道自检优先使用 Chat 或 models。畸形、重复、逗号合并、超长、未展开占位符或误传网关 Key 会拒绝，不能伪装成缺失身份继续。
 
-启用后缺失、空值、重复、逗号合并或过长租户头返回 400。租户头只隔离 Responses 历史，Kiro 内部共享 API Key 的 RPM/额度/用量仍聚合，终端计费和限流继续由 new-api 承担。
+Kiro 在鉴权边界生成派生范围后移除原始凭据头，不传给模型上游、不存入续接历史或错误信息。Kiro 必须是可信内部服务，公网无法绕过 New API 直接调用；跨主机使用受保护的传输。HMAC 是命名空间派生，不是独立鉴权，也不能弥补错误网关配置。日志/APM 不应捕获完整请求头。
 
-续接引用不重复插入上一轮 output；异常 EOF、坏 SSE/二进制帧、未完成工具 JSON 都失败且不保存。上下文超限统一使用 `failed` 与 `context_length_exceeded`。压缩只在完整摘要成功后替换旧历史，有未完成工具时拒绝压缩。进程重启/多实例仍不共享内存状态，需同实例粘滞或回传完整历史。
+Base URL 使用实际 Kiro 地址与端口，不追加 `/v1`；默认端口为 8080，5678 仅为旧示例。保持 `disable_store` 关闭，对需要续接的轮次使用 `store=true`。状态仍为进程内存，多实例需同实例粘滞；重启会丢历史。HMAC 密钥轮换会改变范围；同一客户不同 API Key 不共享历史。Kiro 的共享 Key 用量/RPM/额度仍聚合，New API 继续负责终端计费和限流。
 
-来源取舍与回归清单见 [集成审计](docs/stateful-integration-audit.md)。
+更多迁移与边界见 [零 New API 源码改动接入说明](docs/new-api-config-only.md) 和 [功能集成审计](docs/stateful-integration-audit.md)。
 
 ### 已知限制
 

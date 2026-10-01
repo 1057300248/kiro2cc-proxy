@@ -146,7 +146,18 @@ pub(crate) async fn post_responses(
     let owner_scope = identity
         .as_ref()
         .and_then(|context| context.0.response_store_scope.as_deref());
-    if state.response_store_tenant_header.is_some() && owner_scope.is_none() {
+    if state.response_store_client_auth.is_some() {
+        if let Err(message) =
+            crate::model::client_auth_scope::check_request_scope(&incoming, owner_scope)
+        {
+            return error::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+                Some("client_identity_required"),
+            );
+        }
+    } else if state.response_store_tenant_header.is_some() && owner_scope.is_none() {
         return error::error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",

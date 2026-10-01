@@ -11,7 +11,7 @@ def put(path,text):
         p.write_text(text); changed.add(path)
 def rep(path,old,new):
     s=Path(path).read_text()
-    if new in s: return
+    if old not in s and new in s: return
     assert s.count(old)==1,(path,old[:100],s.count(old))
     put(path,s.replace(old,new))
 

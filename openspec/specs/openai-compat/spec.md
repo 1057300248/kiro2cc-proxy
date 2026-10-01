@@ -216,3 +216,13 @@
 #### 场景：现有测试全绿
 - **WHEN** 执行 `cargo test`
 - **THEN** 本变更前已存在的全部测试用例均通过，无一失败或被修改断言
+
+
+### Requirement: Kiro-only client credential continuation scope
+
+- New API requires no code patch; only its existing explicit Header Override is used.
+- Kiro enables responseStoreClientAuthorizationHeader and requires an environment-only RESPONSE_STORE_HMAC_KEY (32 bytes / 64 hex). Legacy trusted-tenant mode is mutually exclusive.
+- The configured internal header is consumed at the authentication boundary, canonicalized only for the documented standard New API Authorization grammar, and HMAC-scoped. Raw credentials are not logged, forwarded to model upstreams, or persisted in continuation records.
+- Missing identity allows only explicit store=false with no previous_response_id or item_reference. Every continuation requires identity even if store=false. Invalid values never degrade to missing/shared identity.
+- Duplicate/coalesced values, unsupported authentication sentinels, routing suffixes and copied gateway keys are rejected. No user/body metadata/IP/tenant-header fallback is permitted.
+- The gateway MUST overwrite this internal header from the credential it actually authenticated and MUST NOT allow wildcard/regex/dynamic-header passthrough fallbacks. Kiro must only be accessible through the trusted gateway. This is a deployment precondition, not an authentication property created by hashing.

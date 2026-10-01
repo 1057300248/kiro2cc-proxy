@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 use crate::model::api_key::{ApiKeyAuthResult, ApiKeyManager};
+use crate::model::client_auth_scope::{ClientAuthScope, DEFAULT_CLIENT_AUTH_HEADER};
 use crate::model::response_store::ResponseStore;
 use crate::model::rpm::RpmTracker;
 use crate::model::usage::UsageTracker;
@@ -67,6 +68,8 @@ pub struct AppState {
     pub(crate) response_store: Arc<ResponseStore>,
     /// Optional trusted proxy header used to scope Responses continuation state.
     pub(crate) response_store_tenant_header: Option<String>,
+    /// Optional gateway-only client credential scope; raw material is stripped here.
+    pub(crate) response_store_client_auth: Option<Arc<ClientAuthScope>>,
 }
 
 impl AppState {
@@ -82,6 +85,7 @@ impl AppState {
             model_cache: Arc::new(RwLock::new(None)),
             response_store: Arc::new(ResponseStore::default()),
             response_store_tenant_header: None,
+            response_store_client_auth: None,
         }
     }
 
@@ -158,7 +162,20 @@ pub async fn auth_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let Some(key) = auth::extract_api_key(&request) else {
+    let gateway_key = auth::extract_api_key(&request);
+    // Consume the sensitive header before any handler/forwarder sees this request.
+    // Authentication still uses the Kiro gateway key, never the downstream key.
+    let client_scope = if let Some(mode) = &state.response_store_client_auth {
+        Some(mode.take_scope(request.headers_mut(), gateway_key.as_deref()))
+    } else if request.headers().contains_key(DEFAULT_CLIENT_AUTH_HEADER) {
+        request.headers_mut().remove(DEFAULT_CLIENT_AUTH_HEADER);
+        Some(Err(
+            "Client authorization forwarding was received but its Kiro isolation mode is not enabled.",
+        ))
+    } else {
+        None
+    };
+    let Some(key) = gateway_key else {
         let error = ErrorResponse::authentication_error();
         return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
     };
@@ -173,6 +190,20 @@ pub async fn auth_middleware(
                 limit_unit,
                 bound_credential_ids,
             } => {
+                let response_store_scope = match client_scope {
+                    Some(Ok(scope)) => scope,
+                    Some(Err(message)) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse::new("invalid_request_error", message)),
+                        )
+                            .into_response();
+                    }
+                    None => response_store_scope(
+                        &request,
+                        state.response_store_tenant_header.as_deref(),
+                    ),
+                };
                 // 懒激活：首次使用时激活 key
                 if let Err(e) = manager.activate_key(id) {
                     tracing::warn!(api_key_id = id, error = %e, "激活 API Key 失败");
@@ -212,8 +243,6 @@ pub async fn auth_middleware(
                 }
 
                 tracing::debug!(api_key_id = id, api_key_name = %name, "子 API Key 认证通过");
-                let response_store_scope =
-                    response_store_scope(&request, state.response_store_tenant_header.as_deref());
                 request.extensions_mut().insert(ApiKeyContext {
                     id,
                     bound_credential_ids,

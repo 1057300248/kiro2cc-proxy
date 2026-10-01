@@ -14,7 +14,8 @@ use super::config::Config;
 
 pub(crate) const DEFAULT_CLIENT_AUTH_HEADER: &str = "x-kiro2cc-client-authorization";
 const DOMAIN: &[u8] = b"kiro2cc:responses:new-api-key:v1\0";
-const INVALID_CREDENTIAL: &str = "Invalid forwarded client credential; use a standard New API Authorization key.";
+const INVALID_CREDENTIAL: &str =
+    "Invalid forwarded client credential; use a standard New API Authorization key.";
 
 /// Only the parsed header name is public in Debug. The HMAC key never enters
 /// Config serialization, request extensions, error messages, or tracing fields.
@@ -38,8 +39,9 @@ impl ClientAuthScope {
             return Ok(None);
         };
         // Never silently fall back to an older/shared namespace on bad config.
-        let key = std::env::var("RESPONSE_STORE_HMAC_KEY")
-            .map_err(|_| "Client authorization mode requires RESPONSE_STORE_HMAC_KEY (64 hex characters).")?;
+        let key = std::env::var("RESPONSE_STORE_HMAC_KEY").map_err(
+            |_| "Client authorization mode requires RESPONSE_STORE_HMAC_KEY (64 hex characters).",
+        )?;
         Self::new(header, config.response_store_tenant_header.as_deref(), &key).map(Some)
     }
 
@@ -49,7 +51,9 @@ impl ClientAuthScope {
         hex_key: &str,
     ) -> Result<Self, &'static str> {
         if legacy_tenant_header.is_some() {
-            return Err("Configure either responseStoreClientAuthorizationHeader or responseStoreTenantHeader, not both.");
+            return Err(
+                "Configure either responseStoreClientAuthorizationHeader or responseStoreTenantHeader, not both.",
+            );
         }
         let header = header.trim().to_ascii_lowercase();
         // Never consume a routing, transport, or the gateway authentication header.
@@ -63,7 +67,9 @@ impl ClientAuthScope {
             return Err("RESPONSE_STORE_HMAC_KEY must contain exactly 64 hexadecimal characters.");
         }
         if key.iter().all(|byte| *byte == 0) {
-            return Err("RESPONSE_STORE_HMAC_KEY cannot be all zero; generate a random 32-byte key.");
+            return Err(
+                "RESPONSE_STORE_HMAC_KEY cannot be all zero; generate a random 32-byte key.",
+            );
         }
         Ok(Self { header, key })
     }
@@ -87,7 +93,9 @@ impl ClientAuthScope {
         gateway_key: Option<&str>,
     ) -> Result<Option<String>, &'static str> {
         let mut values = headers.get_all(&self.header).iter();
-        let Some(value) = values.next() else { return Ok(None); };
+        let Some(value) = values.next() else {
+            return Ok(None);
+        };
         if values.next().is_some() {
             return Err(INVALID_CREDENTIAL);
         }
@@ -104,7 +112,10 @@ impl ClientAuthScope {
         let mut message = Vec::with_capacity(DOMAIN.len() + canonical.len());
         message.extend_from_slice(DOMAIN);
         message.extend_from_slice(canonical.as_bytes());
-        Ok(Some(format!("new-api-key:v1:{}", hex::encode(hmac_sha256(&self.key, &message)))))
+        Ok(Some(format!(
+            "new-api-key:v1:{}",
+            hex::encode(hmac_sha256(&self.key, &message))
+        )))
     }
 }
 
@@ -117,7 +128,8 @@ fn canonical_new_api_key(raw: &str) -> Result<&str, &'static str> {
         return Err(INVALID_CREDENTIAL);
     }
     let raw = raw.trim();
-    let key = raw.strip_prefix("Bearer ")
+    let key = raw
+        .strip_prefix("Bearer ")
         .or_else(|| raw.strip_prefix("bearer "))
         .unwrap_or(raw)
         .trim();
@@ -150,19 +162,28 @@ fn hmac_sha256(key: &[u8; 32], message: &[u8]) -> [u8; 32] {
 /// self-test may use Chat, models, or explicit store=false with fresh full input.
 /// A continuation is still a read even when its new response uses store=false.
 pub(crate) fn check_request_scope(body: &Value, scope: Option<&str>) -> Result<(), &'static str> {
-    if scope.is_some_and(|value| !value.is_empty()) { return Ok(()); }
+    if scope.is_some_and(|value| !value.is_empty()) {
+        return Ok(());
+    }
     let fresh = match body.get("previous_response_id") {
         None | Some(Value::Null) => true,
         Some(Value::String(id)) => id.trim().is_empty(),
         _ => false,
     };
-    let references = body.get("input").and_then(Value::as_array).is_some_and(|items| {
-        items.iter().any(|item| item.get("type").and_then(Value::as_str) == Some("item_reference"))
-    });
+    let references = body
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.get("type").and_then(Value::as_str) == Some("item_reference"))
+        });
     if body.get("store") == Some(&Value::Bool(false)) && fresh && !references {
         Ok(())
     } else {
-        Err("Forwarded client Authorization is required for Responses storage or continuation. For a stateless probe use store=false without previous_response_id or item_reference.")
+        Err(
+            "Forwarded client Authorization is required for Responses storage or continuation. For a stateless probe use store=false without previous_response_id or item_reference.",
+        )
     }
 }
 
@@ -186,8 +207,14 @@ mod tests {
 
     #[test]
     fn canonical_forms_keep_scope_but_key_case_and_other_clients_do_not() {
-        let mode = mode(); let expected = scope(&mode, A).unwrap();
-        for value in [format!("sk-{A}"), format!("Bearer sk-{A}"), format!("bearer {A}"), format!("Bearer   sk-{A} ")] {
+        let mode = mode();
+        let expected = scope(&mode, A).unwrap();
+        for value in [
+            format!("sk-{A}"),
+            format!("Bearer sk-{A}"),
+            format!("bearer {A}"),
+            format!("Bearer   sk-{A} "),
+        ] {
             assert_eq!(scope(&mode, &value).unwrap(), expected);
         }
         assert_ne!(scope(&mode, B).unwrap(), expected);
@@ -197,10 +224,24 @@ mod tests {
 
     #[test]
     fn invalid_alternate_or_ambiguous_credentials_fail_without_echo() {
-        for value in ["", " ", "midjourney-proxy", "Bearer midjourney-proxy", "{authenticated_tenant}", "{client_header:Authorization}", "Bearer short", "Basic xyz"] {
+        for value in [
+            "",
+            " ",
+            "midjourney-proxy",
+            "Bearer midjourney-proxy",
+            "{authenticated_tenant}",
+            "{client_header:Authorization}",
+            "Bearer short",
+            "Basic xyz",
+        ] {
             assert!(scope(&mode(), value).is_err());
         }
-        for value in [format!("Bearer sk-{A}-123"), format!("Bearer sk-{A},Bearer sk-{B}"), format!("BEARER sk-{A}"), "x".repeat(513)] {
+        for value in [
+            format!("Bearer sk-{A}-123"),
+            format!("Bearer sk-{A},Bearer sk-{B}"),
+            format!("BEARER sk-{A}"),
+            "x".repeat(513),
+        ] {
             let error = scope(&mode(), &value).unwrap_err();
             assert!(!error.contains(&value));
         }
@@ -213,7 +254,10 @@ mod tests {
         headers.append(DEFAULT_CLIENT_AUTH_HEADER, A.parse().unwrap());
         headers.append(DEFAULT_CLIENT_AUTH_HEADER, B.parse().unwrap());
         assert!(mode().take_scope(&mut headers, Some(B)).is_err());
-        assert_eq!(headers.get_all(DEFAULT_CLIENT_AUTH_HEADER).iter().count(), 0);
+        assert_eq!(
+            headers.get_all(DEFAULT_CLIENT_AUTH_HEADER).iter().count(),
+            0
+        );
         assert_eq!(headers["authorization"], format!("Bearer sk-{B}"));
     }
 
@@ -223,17 +267,43 @@ mod tests {
         headers.insert("x-kiro2cc-tenant", A.parse().unwrap());
         headers.insert("x-api-key", A.parse().unwrap());
         assert_eq!(mode().take_scope(&mut headers, None).unwrap(), None);
-        headers.insert(DEFAULT_CLIENT_AUTH_HEADER, format!("Bearer sk-{A}").parse().unwrap());
-        assert!(mode().take_scope(&mut headers, Some(&format!("sk-{A}"))).is_err());
+        headers.insert(
+            DEFAULT_CLIENT_AUTH_HEADER,
+            format!("Bearer sk-{A}").parse().unwrap(),
+        );
+        assert!(
+            mode()
+                .take_scope(&mut headers, Some(&format!("sk-{A}")))
+                .is_err()
+        );
     }
 
     #[test]
     fn startup_configuration_fails_closed_and_debug_redacts_secret() {
-        for header in ["", "Authorization", "X-Api-Key", "Host", "User-Agent", "x-kiro2cc-bad name"] {
+        for header in [
+            "",
+            "Authorization",
+            "X-Api-Key",
+            "Host",
+            "User-Agent",
+            "x-kiro2cc-bad name",
+        ] {
             assert!(ClientAuthScope::new(header, None, &"42".repeat(32)).is_err());
         }
-        assert!(ClientAuthScope::new(DEFAULT_CLIENT_AUTH_HEADER, Some("x-tenant"), &"42".repeat(32)).is_err());
-        for key in ["".to_owned(), "0".repeat(64), "x".repeat(64), "42".repeat(31)] {
+        assert!(
+            ClientAuthScope::new(
+                DEFAULT_CLIENT_AUTH_HEADER,
+                Some("x-tenant"),
+                &"42".repeat(32)
+            )
+            .is_err()
+        );
+        for key in [
+            "".to_owned(),
+            "0".repeat(64),
+            "x".repeat(64),
+            "42".repeat(31),
+        ] {
             assert!(ClientAuthScope::new(DEFAULT_CLIENT_AUTH_HEADER, None, &key).is_err());
         }
         assert!(format!("{:?}", mode()).contains("[REDACTED]"));
@@ -243,27 +313,50 @@ mod tests {
     #[test]
     fn hmac_is_stable_across_restart_and_changes_with_secret_rotation() {
         assert_eq!(scope(&mode(), A).unwrap(), scope(&mode(), A).unwrap());
-        let rotated = ClientAuthScope::new(DEFAULT_CLIENT_AUTH_HEADER, None, &"43".repeat(32)).unwrap();
+        let rotated =
+            ClientAuthScope::new(DEFAULT_CLIENT_AUTH_HEADER, None, &"43".repeat(32)).unwrap();
         assert_ne!(scope(&mode(), A).unwrap(), scope(&rotated, A).unwrap());
     }
 
     #[test]
     fn rfc4231_vectors() {
         // Keys shorter than 32 bytes are zero padded; RFC 2104 pads them to 64.
-        let mut key = [0; 32]; key[..20].fill(0x0b);
-        assert_eq!(hex::encode(hmac_sha256(&key, b"Hi There")), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
-        let mut key = [0; 32]; key[..4].copy_from_slice(b"Jefe");
-        assert_eq!(hex::encode(hmac_sha256(&key, b"what do ya want for nothing?")), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
-        let mut key = [0; 32]; key[..20].fill(0xaa);
-        assert_eq!(hex::encode(hmac_sha256(&key, &[0xdd; 50])), "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
+        let mut key = [0; 32];
+        key[..20].fill(0x0b);
+        assert_eq!(
+            hex::encode(hmac_sha256(&key, b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        let mut key = [0; 32];
+        key[..4].copy_from_slice(b"Jefe");
+        assert_eq!(
+            hex::encode(hmac_sha256(&key, b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        let mut key = [0; 32];
+        key[..20].fill(0xaa);
+        assert_eq!(
+            hex::encode(hmac_sha256(&key, &[0xdd; 50])),
+            "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"
+        );
     }
 
     #[test]
     fn no_identity_allows_only_explicit_fresh_stateless_requests() {
-        assert!(check_request_scope(&json!({"store":false,"input":"probe"}),None).is_ok());
-        for body in [json!({"input":"x"}), json!({"store":true}), json!({"store":null}), json!({"store":false,"previous_response_id":"resp_other"}), json!({"store":false,"input":[{"type":"item_reference","id":"i"}]})] {
-            assert!(check_request_scope(&body,None).is_err());
-            assert!(check_request_scope(&body,Some("verified-scope")).is_ok());
+        assert!(check_request_scope(&json!({"store":false,"input":"probe"}), None).is_ok());
+        for body in [
+            json!({"input":"x"}),
+            json!({"store":true}),
+            json!({"store":null}),
+            json!({"store":false,"previous_response_id":"resp_other"}),
+            json!({"store":false,"input":[{"type":"item_reference","id":"i"}]}),
+        ] {
+            assert!(check_request_scope(&body, None).is_err());
+            assert!(check_request_scope(&body, Some("verified-scope")).is_ok());
         }
     }
 }
+
+#[cfg(test)]
+#[path = "client_auth_scope_integration_tests.rs"]
+mod integration_tests;
