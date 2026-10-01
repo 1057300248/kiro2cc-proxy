@@ -7,6 +7,9 @@ on:
     paths:
       - 'src/**'
       - 'Cargo.*'
+      - 'admin-ui/**'
+      - 'user-ui/**'
+      - '.github/scripts/**'
       - '.github/workflows/stateful-review.yml'
   workflow_dispatch:
 
@@ -31,14 +34,14 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
       - uses: pnpm/action-setup@v4
         with:
           version: 9
       - name: Build embedded UIs
         run: |
-          (cd admin-ui && pnpm install && pnpm build)
-          (cd user-ui && npm install && npm run build)
+          (cd admin-ui && pnpm install && node ../.github/scripts/ensure-rollup-native.cjs && pnpm build)
+          (cd user-ui && npm install && node ../.github/scripts/ensure-rollup-native.cjs && npm run build)
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -57,7 +60,7 @@ jobs:
         run: |
           git rev-parse HEAD > validation-source.txt
           sha256sum target/release/kiro2cc-proxy > validation-release-sha256.txt
-          git diff --exit-code -- Cargo.toml Cargo.lock
+          git diff --exit-code -- Cargo.toml Cargo.lock admin-ui/package.json user-ui/package.json
           {
             echo '## Verified source'
             cat validation-source.txt
