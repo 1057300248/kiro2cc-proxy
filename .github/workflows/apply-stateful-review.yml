@@ -1,0 +1,100 @@
+name: Apply Stateful Review Fixes
+
+on:
+  push:
+    branches: ['codex/stateful-responses-20260930']
+    paths:
+      - 'maintenance/stateful_review_20261001.py'
+      - '.github/workflows/apply-stateful-review.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apply-stateful-review
+  cancel-in-progress: true
+
+jobs:
+  apply-and-verify:
+    if: github.repository == '1057300248/kiro2cc-proxy' && github.event_name == 'push'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Apply exact-source patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor 033b220aecc4db92426bb90a7588bd408f08e656 HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('maintenance/stateful_review_20261001.py')
+          s = p.read_text()
+          p.write_text(s.replace(r'pub\(crate\)', r'pub\((?:crate|super)\)'))
+          PY
+          python3 maintenance/stateful_review_20261001.py
+          echo maintenance/stateful_review_20261001.py >> .review-changed-paths
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: Build embedded UIs
+        run: |
+          (cd admin-ui && pnpm install && pnpm build)
+          (cd user-ui && npm install && npm run build)
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format and capture exact source diff
+        run: |
+          cargo fmt --all
+          git add --pathspec-from-file=.review-changed-paths
+          git diff --cached --check
+          git diff --cached > review-source.patch
+          git diff --exit-code -- Cargo.toml Cargo.lock
+      - name: Type check
+        run: cargo check --locked --all-targets 2>&1 | tee review-check.log
+      - name: Clippy
+        run: cargo clippy --locked --all-targets 2>&1 | tee review-clippy.log
+      - name: Regression tests
+        run: cargo test --locked 2>&1 | tee review-tests.log
+      - name: Release build
+        run: cargo build --release --locked 2>&1 | tee review-release.log
+      - name: Publish only validated changes, without force-pushing
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          branch=codex/stateful-responses-20260930
+          remote=$(git ls-remote origin "refs/heads/$branch" | cut -f1)
+          test "$remote" = "$EXPECTED_SHA"
+          git diff --exit-code
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix: 修复有状态续接、流终态、压缩与租户头边界'
+          git push origin "HEAD:refs/heads/$branch"
+          git rev-parse HEAD | tee review-published-sha.txt
+          sha256sum target/release/kiro2cc-proxy | tee review-release-sha256.txt
+      - name: Capture failure diff
+        if: always()
+        run: |
+          git diff > review-unstaged.patch
+          git status --short > review-status.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stateful-review-evidence-${{ github.run_id }}
+          path: |
+            review-*.log
+            review-*.patch
+            review-*.txt
+          retention-days: 7
