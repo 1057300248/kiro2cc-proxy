@@ -34,7 +34,20 @@ jobs:
       - name: Apply exact Kiro integration
         run: |
           git merge-base --is-ancestor f5958804a04f3e74f2caf1dd3c87bebd1830efd9 HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('maintenance/apply_client_scope.py')
+          text = p.read_text()
+          old = '    if new in s: return\n    assert s.count(old)==1'
+          new = '    if old not in s and new in s: return\n    assert s.count(old)==1'
+          if old in text:
+              assert text.count(old) == 1
+              p.write_text(text.replace(old, new))
+          else:
+              assert new in text
+          PY
           python3 maintenance/apply_client_scope.py
+          echo maintenance/apply_client_scope.py >> .client-scope-changed-paths
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
