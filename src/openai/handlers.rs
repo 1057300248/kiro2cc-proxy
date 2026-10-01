@@ -136,10 +136,22 @@ pub(crate) async fn post_responses(
             Some("invalid_api_key"),
         );
     };
-    let prepared = match state
-        .response_store
-        .prepare_request(owner_api_key_id, &incoming)
-    {
+    let owner_scope = identity
+        .as_ref()
+        .and_then(|context| context.0.response_store_scope.as_deref());
+    if state.response_store_tenant_header.is_some() && owner_scope.is_none() {
+        return error::error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Configured Responses tenant header is missing or invalid.",
+            None,
+        );
+    }
+    let prepared = match state.response_store.prepare_request_with_scope(
+        owner_api_key_id,
+        owner_scope,
+        &incoming,
+    ) {
         Ok(prepared) => prepared,
         Err(msg) => {
             return error::error_response(
@@ -180,8 +192,9 @@ pub(crate) async fn post_responses(
     let tool_name_map = converted.tool_name_map;
     let stream_tool_name_map = tool_name_map.clone();
     let is_compaction = converted.is_compaction;
-    let persistence = state.response_store.persistence(
+    let persistence = state.response_store.persistence_with_scope(
         owner_api_key_id,
+        owner_scope,
         prepared.history,
         prepared.store_response,
     );

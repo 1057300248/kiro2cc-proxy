@@ -501,6 +501,7 @@ Kiro 上游的 4 个接入端点（`ide` / `runtime` / `codewhisperer` / `amazon
 | `proxyPassword` | 否 | — | 代理密码 |
 | `tlsBackend` | 否 | `rustls` | TLS 后端：`rustls` 或 `native-tls` |
 | `loadBalancingMode` | 否 | `priority` | `priority`（按优先级）或 `balanced`（轮询） |
+| `responseStoreTenantHeader` | 否 | — | 可信反代传入的租户身份请求头；配置后按该请求头隔离 Responses 续接历史 |
 
 > **TLS 说明**：如遇到 Token 刷新失败或请求报错，尝试将 `tlsBackend` 改为 `native-tls`。
 
@@ -682,9 +683,39 @@ print(resp.choices[0].message.content)
 
 模型名可填 `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-5.6-sol`，也可直接填 `claude-*` 系模型名（原样透传给上游）。Codex CLI 自带的 `gpt-5-codex` / `gpt-5.1-codex` 会自动映射到 `gpt-5.6-terra`，`gpt-5.1-codex-max` 映射到 `gpt-5.6-luna`。
 
+### 通过 new-api 反代并共享上游 Key
+
+如果 new-api 对外提供多用户服务，而所有请求都使用同一个 kiro2cc 上游 API Key，必须额外传递客户端租户身份，否则不同用户可能共用同一个 `previous_response_id` 命名空间。建议让 new-api 写入一个只由反代生成的请求头：
+
+kiro2cc 的 `config.json`：
+
+```json
+{
+  "responseStoreTenantHeader": "X-Kiro2CC-Tenant"
+}
+```
+
+new-api 对应渠道的 **Header Override**：
+
+```json
+{
+  "X-Kiro2CC-Tenant": "{client_header:Authorization}"
+}
+```
+
+该渠道的 Base URL 填 `http://kiro2cc:5678`（不要再追加 `/v1`）；new-api 的 OpenAI 适配器会按请求类型追加 `/v1/responses` 或 `/v1/chat/completions`。模型映射照常把对外模型名映射到 kiro2cc 支持的模型名。
+
+`{client_header:Authorization}` 会读取进入 new-api 的客户端 Authorization，并由 kiro2cc 做 SHA-256 哈希后作为会话隔离范围；原始值不会写入日志或会话存储。若客户端使用 `x-api-key`，将占位符中的请求头名替换为 `x-api-key`。new-api 渠道的 `disable_store` 必须保持关闭，否则客户端的 `store=true` 不会到达 kiro2cc。
+
+该请求头是“可信反代”信号，不是额外的认证凭据。kiro2cc 应只允许 new-api 所在网络访问，并由 new-api 覆盖/过滤客户端同名请求头。多实例部署仍需让同一会话粘滞到同一 kiro2cc 实例；当前 Responses 状态保存于进程内，重启后会清空。
+
+启用 `responseStoreTenantHeader` 后，Responses 请求如果缺少该请求头会直接返回 400，避免误配置时让多个用户落入同一个状态命名空间。
+
+该租户头只隔离 Responses 续接历史，不会把 kiro2cc 内部按 API Key 的用量、RPM 或额度统计拆分；共享上游 Key 的鉴权、限额和计费应继续由 new-api 负责。
+
 ### 已知限制
 
-- **`previous_response_id` 为进程内有状态实现** —— 默认 `store=true` 时按 API Key 隔离保存续接历史，TTL 为 1 小时；`store=false` 不保存。本实现不跨进程/重启持久化，多实例部署时应保持同一会话粘滞到同一实例或后续接入共享存储。
+- **`previous_response_id` 为进程内有状态实现** —— 默认 `store=true` 时按 API Key 隔离保存续接历史；配置 `responseStoreTenantHeader` 后，会在 API Key 内再按可信反代租户头隔离。TTL 为 1 小时；`store=false` 不保存。本实现不跨进程/重启持久化，多实例部署时应保持同一会话粘滞到同一实例或后续接入共享存储。
 - **`tool_choice` 仅支持 `auto`** —— 其他取值（`required` / 指定函数名）会记 WARN 后按 `auto` 处理，这是上游 Kiro API 的既有限制。
 - **`reasoning.effort` 对 `gpt-5.6-luna` 无效** —— 该模型上游恒返回 `thinking=0`。
 - **`include: ["reasoning.encrypted_content"]` 被忽略** —— 代理不产出加密 reasoning 内容。

@@ -3,7 +3,8 @@
 //!
 //! The Kiro upstream is stateless from the OpenAI client's point of view. This
 //! store reconstructs the prior Responses input/output history for
-//! previous_response_id while keeping histories isolated by authenticated API key.
+//! previous_response_id while keeping histories isolated by authenticated API key
+//! or a trusted upstream tenant scope.
 
 use std::{
     collections::HashMap,
@@ -22,6 +23,7 @@ const DEFAULT_MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct StoreKey {
     owner_api_key_id: u32,
+    owner_scope: Option<String>,
     response_id: String,
 }
 
@@ -89,9 +91,20 @@ impl ResponseStore {
     }
 
     /// Resolve previous_response_id and item_reference before protocol conversion.
+    #[allow(dead_code)]
     pub(crate) fn prepare_request(
         &self,
         owner_api_key_id: u32,
+        body: &Value,
+    ) -> Result<PreparedResponsesRequest, String> {
+        self.prepare_request_with_scope(owner_api_key_id, None, body)
+    }
+
+    /// Resolve a request using an optional trusted proxy tenant scope.
+    pub(crate) fn prepare_request_with_scope(
+        &self,
+        owner_api_key_id: u32,
+        owner_scope: Option<&str>,
         body: &Value,
     ) -> Result<PreparedResponsesRequest, String> {
         let mut prepared = body.clone();
@@ -115,9 +128,12 @@ impl ResponseStore {
         };
 
         let previous = if let Some(id) = previous_response_id.as_deref() {
-            Some(self.get_response(owner_api_key_id, id).ok_or_else(|| {
-                "previous_response_id 未找到、已过期，或不属于当前 API Key".to_string()
-            })?)
+            Some(
+                self.get_response(owner_api_key_id, owner_scope, id)
+                    .ok_or_else(|| {
+                        "previous_response_id 未找到、已过期，或不属于当前 API Key".to_string()
+                    })?,
+            )
         } else {
             None
         };
@@ -151,26 +167,45 @@ impl ResponseStore {
     }
 
     /// Create a persistence handle for one response, or None when store=false.
+    #[allow(dead_code)]
     pub(crate) fn persistence(
         self: &Arc<Self>,
         owner_api_key_id: u32,
         history: Vec<Value>,
         enabled: bool,
     ) -> Option<ResponsePersistence> {
+        self.persistence_with_scope(owner_api_key_id, None, history, enabled)
+    }
+
+    /// Create a persistence handle scoped to an optional trusted proxy tenant.
+    pub(crate) fn persistence_with_scope(
+        self: &Arc<Self>,
+        owner_api_key_id: u32,
+        owner_scope: Option<&str>,
+        history: Vec<Value>,
+        enabled: bool,
+    ) -> Option<ResponsePersistence> {
         enabled.then(|| ResponsePersistence {
             store: Arc::clone(self),
             owner_api_key_id,
+            owner_scope: owner_scope.map(str::to_owned),
             history,
         })
     }
 
-    fn get_response(&self, owner_api_key_id: u32, response_id: &str) -> Option<StoredResponse> {
+    fn get_response(
+        &self,
+        owner_api_key_id: u32,
+        owner_scope: Option<&str>,
+        response_id: &str,
+    ) -> Option<StoredResponse> {
         let now = Instant::now();
         let mut inner = self.inner.lock();
         prune_expired(&mut inner, now);
 
         let key = StoreKey {
             owner_api_key_id,
+            owner_scope: owner_scope.map(str::to_owned),
             response_id: response_id.to_string(),
         };
         let entry = inner.entries.get_mut(&key)?;
@@ -179,7 +214,13 @@ impl ResponseStore {
         Some(entry.clone())
     }
 
-    fn save_response(&self, owner_api_key_id: u32, base_history: &[Value], response: &Value) {
+    fn save_response(
+        &self,
+        owner_api_key_id: u32,
+        owner_scope: Option<&str>,
+        base_history: &[Value],
+        response: &Value,
+    ) {
         let Some(response_id) = response.get("id").and_then(Value::as_str) else {
             tracing::warn!("Responses store: response 缺少 id，跳过保存");
             return;
@@ -214,6 +255,7 @@ impl ResponseStore {
         let now = Instant::now();
         let key = StoreKey {
             owner_api_key_id,
+            owner_scope: owner_scope.map(str::to_owned),
             response_id: response_id.to_string(),
         };
         let mut inner = self.inner.lock();
@@ -258,13 +300,18 @@ impl ResponseStore {
 pub(crate) struct ResponsePersistence {
     store: Arc<ResponseStore>,
     owner_api_key_id: u32,
+    owner_scope: Option<String>,
     history: Vec<Value>,
 }
 
 impl ResponsePersistence {
     pub(crate) fn persist(&self, response: &Value) {
-        self.store
-            .save_response(self.owner_api_key_id, &self.history, response);
+        self.store.save_response(
+            self.owner_api_key_id,
+            self.owner_scope.as_deref(),
+            &self.history,
+            response,
+        );
     }
 }
 
@@ -406,6 +453,32 @@ mod tests {
         }));
     }
 
+    fn save_scoped_seed(store: &Arc<ResponseStore>, owner: u32, scope: &str) {
+        let persistence = store
+            .persistence_with_scope(
+                owner,
+                Some(scope),
+                vec![json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "first"}],
+                })],
+                true,
+            )
+            .unwrap();
+        persistence.persist(&json!({
+            "id": "resp_scoped",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg_scoped",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "answer", "annotations": []}],
+            }],
+        }));
+    }
+
     #[test]
     fn previous_response_is_replayed_for_same_api_key() {
         let store = test_store();
@@ -445,6 +518,40 @@ mod tests {
             )
             .err()
             .expect("other API key must not resolve the response");
+        assert!(err.contains("未找到"));
+    }
+
+    #[test]
+    fn previous_response_is_isolated_by_trusted_tenant_scope() {
+        let store = test_store();
+        save_scoped_seed(&store, 7, "tenant-a");
+
+        assert!(
+            store
+                .prepare_request_with_scope(
+                    7,
+                    Some("tenant-a"),
+                    &json!({
+                        "model": "gpt-5-codex",
+                        "previous_response_id": "resp_scoped",
+                        "input": "same tenant",
+                    }),
+                )
+                .is_ok()
+        );
+
+        let err = store
+            .prepare_request_with_scope(
+                7,
+                Some("tenant-b"),
+                &json!({
+                    "model": "gpt-5-codex",
+                    "previous_response_id": "resp_scoped",
+                    "input": "other tenant",
+                }),
+            )
+            .err()
+            .expect("other tenant must not resolve the response");
         assert!(err.contains("未找到"));
     }
 

@@ -148,6 +148,10 @@ pub struct Config {
     #[serde(default = "default_model_cache_ttl_secs")]
     pub model_cache_ttl_secs: u64,
 
+    /// 可信反代传入的租户身份请求头（用于 Responses continuation 隔离）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_store_tenant_header: Option<String>,
+
     /// Prompt cache 模拟与指纹追踪配置
     #[serde(default)]
     pub cache_simulation: CacheSimulationConfig,
@@ -225,6 +229,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             max_rpm_per_credential: default_max_rpm_per_credential(),
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
+            response_store_tenant_header: None,
             cache_simulation: CacheSimulationConfig::default(),
             config_path: None,
         }
@@ -284,6 +289,7 @@ impl Config {
     /// - `PROXY_PASSWORD`: 代理密码
     /// - `LOAD_BALANCING_MODE`: 负载均衡模式
     /// - `MODEL_CACHE_TTL_SECS`: /v1/models 动态列表缓存 TTL（秒）
+    /// - `RESPONSE_STORE_TENANT_HEADER`: 可信反代租户身份请求头
     pub fn apply_env_overrides(&mut self) {
         if let Ok(v) = env::var("HOST") {
             self.host = v;
@@ -323,6 +329,9 @@ impl Config {
             && let Ok(n) = v.parse::<u64>()
         {
             self.model_cache_ttl_secs = n;
+        }
+        if let Ok(v) = env::var("RESPONSE_STORE_TENANT_HEADER") {
+            self.response_store_tenant_header = (!v.trim().is_empty()).then_some(v);
         }
 
         // CacheSimulationConfig 嵌套字段覆盖
@@ -376,5 +385,18 @@ mod tests {
     fn test_model_cache_ttl_deserialize_explicit() {
         let config: Config = serde_json::from_str(r#"{"modelCacheTtlSecs": 60}"#).unwrap();
         assert_eq!(config.model_cache_ttl_secs, 60);
+    }
+
+    #[test]
+    fn test_response_store_tenant_header_is_optional() {
+        let default_config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(default_config.response_store_tenant_header, None);
+
+        let configured: Config =
+            serde_json::from_str(r#"{"responseStoreTenantHeader":"X-Kiro2CC-Tenant"}"#).unwrap();
+        assert_eq!(
+            configured.response_store_tenant_header.as_deref(),
+            Some("X-Kiro2CC-Tenant")
+        );
     }
 }

@@ -11,6 +11,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use parking_lot::RwLock;
+use sha2::{Digest, Sha256};
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
@@ -39,6 +40,10 @@ pub struct ApiKeyContext {
     pub id: u32,
     /// 绑定的账号 ID 列表，None 表示不限制
     pub bound_credential_ids: Option<Vec<u64>>,
+    /// Optional hashed tenant identity supplied by a trusted reverse proxy.
+    /// This keeps Responses continuation state isolated when many downstream
+    /// users share one authenticated upstream API key.
+    pub response_store_scope: Option<String>,
 }
 
 /// 应用共享状态
@@ -58,8 +63,10 @@ pub struct AppState {
     pub fingerprint_tracker: Option<Arc<crate::cache::fingerprint::FingerprintTracker>>,
     /// `/v1/models` 动态列表缓存（TTL 见 `Config::model_cache_ttl_secs`），初始为空
     pub model_cache: Arc<RwLock<Option<CachedModels>>>,
-    /// OpenAI Responses continuation store（按 API Key 隔离）
+    /// OpenAI Responses continuation store（按 API Key 隔离，可叠加可信租户范围）
     pub(crate) response_store: Arc<ResponseStore>,
+    /// Optional trusted proxy header used to scope Responses continuation state.
+    pub(crate) response_store_tenant_header: Option<String>,
 }
 
 impl AppState {
@@ -74,6 +81,7 @@ impl AppState {
             fingerprint_tracker: None,
             model_cache: Arc::new(RwLock::new(None)),
             response_store: Arc::new(ResponseStore::default()),
+            response_store_tenant_header: None,
         }
     }
 
@@ -115,6 +123,28 @@ impl AppState {
         self.fingerprint_tracker = Some(tracker);
         self
     }
+
+    /// Configure a trusted reverse-proxy header for Responses tenant isolation.
+    pub fn with_response_store_tenant_header(mut self, header_name: impl Into<String>) -> Self {
+        let header_name = header_name.into().trim().to_ascii_lowercase();
+        if !header_name.is_empty() {
+            self.response_store_tenant_header = Some(header_name);
+        }
+        self
+    }
+}
+
+/// Hash a trusted proxy tenant value before retaining it in memory or using it
+/// as part of a continuation-store key. The raw upstream credential never
+/// enters the store key or logs.
+fn response_store_scope(request: &Request<Body>, header_name: Option<&str>) -> Option<String> {
+    let value = header_name
+        .and_then(|name| request.headers().get(name))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let digest = Sha256::digest(value.as_bytes());
+    Some(format!("sha256:{digest:x}"))
 }
 
 /// API Key 认证中间件
@@ -181,9 +211,12 @@ pub async fn auth_middleware(
                 }
 
                 tracing::debug!(api_key_id = id, api_key_name = %name, "子 API Key 认证通过");
+                let response_store_scope =
+                    response_store_scope(&request, state.response_store_tenant_header.as_deref());
                 request.extensions_mut().insert(ApiKeyContext {
                     id,
                     bound_credential_ids,
+                    response_store_scope,
                 });
                 return next.run(request).await;
             }
@@ -228,4 +261,48 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use http::Request;
+
+    use super::{AppState, response_store_scope};
+
+    #[test]
+    fn response_store_scope_trims_values_and_separates_tenants() {
+        let tenant_a = Request::builder()
+            .header("X-Kiro2CC-Tenant", " tenant-a ")
+            .body(Body::empty())
+            .unwrap();
+        let tenant_a_without_padding = Request::builder()
+            .header("x-kiro2cc-tenant", "tenant-a")
+            .body(Body::empty())
+            .unwrap();
+        let tenant_b = Request::builder()
+            .header("X-Kiro2CC-Tenant", "tenant-b")
+            .body(Body::empty())
+            .unwrap();
+
+        let scope_a = response_store_scope(&tenant_a, Some("x-kiro2cc-tenant"));
+        assert_eq!(
+            scope_a,
+            response_store_scope(&tenant_a_without_padding, Some("x-kiro2cc-tenant"))
+        );
+        assert_ne!(
+            scope_a,
+            response_store_scope(&tenant_b, Some("x-kiro2cc-tenant"))
+        );
+        assert!(response_store_scope(&tenant_a, None).is_none());
+    }
+
+    #[test]
+    fn response_store_tenant_header_name_is_normalized() {
+        let state = AppState::new().with_response_store_tenant_header(" X-Kiro2CC-Tenant ");
+        assert_eq!(
+            state.response_store_tenant_header.as_deref(),
+            Some("x-kiro2cc-tenant")
+        );
+    }
 }

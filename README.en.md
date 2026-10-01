@@ -480,6 +480,7 @@ Lower `priority` value = higher priority. Up to 3 retries per account, 9 per req
 | `proxyPassword` | No | — | Proxy password |
 | `tlsBackend` | No | `rustls` | TLS backend: `rustls` or `native-tls` |
 | `loadBalancingMode` | No | `priority` | `priority` (by priority) or `balanced` (round-robin) |
+| `responseStoreTenantHeader` | No | — | Trusted reverse-proxy tenant header; scopes Responses continuation history within an API key |
 
 > **TLS note**: If you encounter token refresh failures or request errors, try switching `tlsBackend` to `native-tls`.
 
@@ -661,9 +662,37 @@ print(resp.choices[0].message.content)
 
 Model name can be `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-5.6-sol`, or any `claude-*` model name (passed through as-is to upstream). Codex CLI's built-in `gpt-5-codex` / `gpt-5.1-codex` auto-map to `gpt-5.6-terra`, and `gpt-5.1-codex-max` maps to `gpt-5.6-luna`.
 
+### Reverse proxy through new-api with a shared upstream key
+
+When new-api serves multiple downstream users but sends the same kiro2cc upstream API key for every request, pass a tenant identity as a separate header. Otherwise different users share the same `previous_response_id` namespace. Configure kiro2cc with:
+
+```json
+{
+  "responseStoreTenantHeader": "X-Kiro2CC-Tenant"
+}
+```
+
+Set the new-api channel's **Header Override** to:
+
+```json
+{
+  "X-Kiro2CC-Tenant": "{client_header:Authorization}"
+}
+```
+
+Set the channel Base URL to `http://kiro2cc:5678` without a `/v1` suffix. new-api's OpenAI adaptor appends `/v1/responses` or `/v1/chat/completions` for the selected request type. Configure the channel's model mapping to the model names supported by kiro2cc.
+
+`{client_header:Authorization}` reads the Authorization header received by new-api. kiro2cc stores only its SHA-256 hash as the continuation scope; the raw value is not written to logs or the in-memory store. If clients authenticate with `x-api-key`, use `{client_header:x-api-key}` instead. Keep the channel's `disable_store` setting off so `store=true` reaches kiro2cc.
+
+This header is a trusted-proxy signal, not an additional credential. Restrict kiro2cc to the new-api network and make new-api overwrite or filter the client-supplied header. Multi-instance deployments still need session stickiness because Responses state is process-local and is cleared on restart.
+
+When `responseStoreTenantHeader` is enabled, Responses requests without that header return HTTP 400. This fails closed instead of placing multiple users in one state namespace when the proxy is misconfigured.
+
+The tenant header scopes Responses continuation history only. Usage, RPM, and spending records inside kiro2cc remain aggregated under the shared API key, so new-api should continue to enforce downstream authentication, limits, and billing.
+
 ### Known Limitations
 
-- **`previous_response_id` uses an in-process state store** — with the default `store=true`, continuation history is isolated by API key and retained for 1 hour; `store=false` disables persistence. State does not survive process restarts or span multiple instances, so multi-instance deployments should keep a conversation sticky to one instance until a shared store is added.
+- **`previous_response_id` uses an in-process state store** — with the default `store=true`, continuation history is isolated by API key; when `responseStoreTenantHeader` is configured, it is additionally scoped by the trusted proxy tenant header. Entries are retained for 1 hour; `store=false` disables persistence. State does not survive process restarts or span multiple instances, so multi-instance deployments should keep a conversation sticky to one instance until a shared store is added.
 - **`tool_choice` only supports `auto`** — other values (`required` or a specific function name) are logged as WARN and treated as `auto`; this is an existing limitation of the upstream Kiro API.
 - **`reasoning.effort` has no effect on `gpt-5.6-luna`** — this model always returns `thinking=0` upstream.
 - **`include: ["reasoning.encrypted_content"]` is ignored** — the proxy doesn't produce encrypted reasoning content.

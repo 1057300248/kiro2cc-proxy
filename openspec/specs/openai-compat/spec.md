@@ -133,6 +133,14 @@
 - **WHEN** 请求含非空 `previous_response_id`，且该响应由当前 API Key 在 TTL 内以 `store=true` 产生
 - **THEN** 代理在触达 Kiro 前恢复此前输入与输出历史，再拼接本轮 `input`；不同 API Key 不得读取彼此的响应历史
 
+#### 场景：共享上游 Key 时按可信反代租户隔离
+- **WHEN** 配置 `responseStoreTenantHeader`，且请求由反代在该请求头中传入租户身份
+- **THEN** 代理只保留该身份的 SHA-256 哈希，并将其与 API Key 一起作为 continuation store 的隔离范围；同一 API Key 下不同租户不得读取彼此的响应历史
+
+#### 场景：租户请求头缺失时拒绝有状态 Responses 请求
+- **WHEN** 已配置 `responseStoreTenantHeader`，但 `POST /v1/responses` 未携带有效的该请求头
+- **THEN** 代理返回 `400`，不读取或写入共享的 continuation 命名空间
+
 #### 场景：store=false
 - **WHEN** Responses 请求显式包含 `store:false`
 - **THEN** 本轮响应不写入 continuation store，后续以其 response id 续接时返回明确的 `400`
