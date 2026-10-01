@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: apply-stateful-review
   cancel-in-progress: true
@@ -27,15 +31,23 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
       - name: Apply exact-source patches
-        shell: bash
         run: |
-          set -euo pipefail
-          git merge-base --is-ancestor 033b220aecc4db92426bb90a7588bd408f08e656 HEAD
+          git merge-base --is-ancestor 5fe5493b566513f9c9e4c8e4fdb04512deaf3e79 HEAD
           python3 - <<'PY'
           from pathlib import Path
           p = Path('maintenance/stateful_review_20261001.py')
           s = p.read_text()
-          p.write_text(s.replace(r'pub\(crate\)', r'pub\((?:crate|super)\)'))
+          old = 'Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, deadline, bridge, bridge_ctx, provider, round_in_flight)))'
+          new = old.replace('decoder, false', 'decoder, decode_failed')
+          source = f'rep(p,{old!r},{new!r})'
+          suffix = '\n                        }\n                        Some(Err(e)) => {'
+          replacement = f'rep(p,{(old + suffix)!r},{(new + suffix)!r})'
+          if source in s:
+              assert s.count(source) == 1
+              s = s.replace(source, replacement)
+          else:
+              assert replacement in s
+          p.write_text(s)
           PY
           python3 maintenance/stateful_review_20261001.py
           echo maintenance/stateful_review_20261001.py >> .review-changed-paths
@@ -80,7 +92,7 @@ jobs:
           if git diff --cached --quiet; then exit 0; fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'fix: 修复有状态续接、流终态、压缩与租户头边界'
+          git commit -m 'fix: 补齐传输失败闭合、包装器回归和接入审计'
           git push origin "HEAD:refs/heads/$branch"
           git rev-parse HEAD | tee review-published-sha.txt
           sha256sum target/release/kiro2cc-proxy | tee review-release-sha256.txt
