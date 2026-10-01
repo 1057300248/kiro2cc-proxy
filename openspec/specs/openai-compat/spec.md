@@ -163,7 +163,7 @@
 
 #### 场景：上下文窗口耗尽
 - **WHEN** 上游 `stop_reason` 为 `model_context_window_exceeded`
-- **THEN** 非流式响应返回 `incomplete_details.reason = context_window_exceeded`；流式以 `response.failed` 收尾，`response.error.code = context_length_exceeded`，不得伪装为 `max_output_tokens`
+- **THEN** 非流式响应返回 `status = failed` 及 `error.code = context_length_exceeded`；流式以 `response.failed` 收尾，`response.error.code = context_length_exceeded`，不得伪装为 `max_output_tokens`
 
 ---
 

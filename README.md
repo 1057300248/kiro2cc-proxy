@@ -685,33 +685,29 @@ print(resp.choices[0].message.content)
 
 ### 通过 new-api 反代并共享上游 Key
 
-如果 new-api 对外提供多用户服务，而所有请求都使用同一个 kiro2cc 上游 API Key，必须额外传递客户端租户身份，否则不同用户可能共用同一个 `previous_response_id` 命名空间。建议让 new-api 写入一个只由反代生成的请求头：
-
-kiro2cc 的 `config.json`：
+Kiro 配置写在本服务的 `config.json`（或环境变量 `RESPONSE_STORE_TENANT_HEADER`），不是 new-api 的请求体覆盖：
 
 ```json
-{
-  "responseStoreTenantHeader": "X-Kiro2CC-Tenant"
-}
+{"responseStoreTenantHeader":"X-Kiro2CC-Tenant"}
 ```
 
-new-api 对应渠道的 **Header Override**：
+使用配套的 new-api 已认证租户补丁后，渠道 **Header Override** 设置为：
 
 ```json
-{
-  "X-Kiro2CC-Tenant": "{client_header:Authorization}"
-}
+{"X-Kiro2CC-Tenant":"{authenticated_tenant}"}
 ```
 
-该渠道的 Base URL 填 `http://kiro2cc:5678`（不要再追加 `/v1`）；new-api 的 OpenAI 适配器会按请求类型追加 `/v1/responses` 或 `/v1/chat/completions`。模型映射照常把对外模型名映射到 kiro2cc 支持的模型名。
+该占位符由 new-api 鉴权成功后的用户 ID / Token ID 派生不透明 HMAC 标识；不是原始请求头。不同 token 互相隔离，同一个已认证 token 的不同请求头格式保持同一范围。渠道密钥轮换会改变范围，需新建会话或回传完整历史。不要以 `{client_header:Authorization}`、`{client_header:x-api-key}` 或任意客户端租户头充当所有者边界。
 
-`{client_header:Authorization}` 会读取进入 new-api 的客户端 Authorization，并由 kiro2cc 做 SHA-256 哈希后作为会话隔离范围；原始值不会写入日志或会话存储。若客户端使用 `x-api-key`，将占位符中的请求头名替换为 `x-api-key`。new-api 渠道的 `disable_store` 必须保持关闭，否则客户端的 `store=true` 不会到达 kiro2cc。
+配套变更位于 `1057300248/wanchuan-new-api` 的 `codex/kiro-authenticated-tenant-20261001` 分支；未合入该补丁的 new-api 不能把这个占位符作为字面量转发。正常上游 Authorization 仍使用 Kiro 渠道密钥。渠道自检使用单独命名空间。
 
-该请求头是“可信反代”信号，不是额外的认证凭据。kiro2cc 应只允许 new-api 所在网络访问，并由 new-api 覆盖/过滤客户端同名请求头。多实例部署仍需让同一会话粘滞到同一 kiro2cc 实例；当前 Responses 状态保存于进程内，重启后会清空。
+Base URL 使用实际可达的 Kiro 服务地址与监听端口，不追加 `/v1`；`5678` 只是历史示例，不是程序默认端口。保持 `disable_store` 关闭，要续接的轮次使用 `store=true`。Kiro 必须仅对可信网关/私网开放；跨主机使用受保护传输。租户头只是状态命名空间，不替代认证，也不是逐请求签名。
 
-启用 `responseStoreTenantHeader` 后，Responses 请求如果缺少该请求头会直接返回 400，避免误配置时让多个用户落入同一个状态命名空间。
+启用后缺失、空值、重复、逗号合并或过长租户头返回 400。租户头只隔离 Responses 历史，Kiro 内部共享 API Key 的 RPM/额度/用量仍聚合，终端计费和限流继续由 new-api 承担。
 
-该租户头只隔离 Responses 续接历史，不会把 kiro2cc 内部按 API Key 的用量、RPM 或额度统计拆分；共享上游 Key 的鉴权、限额和计费应继续由 new-api 负责。
+续接引用不重复插入上一轮 output；异常 EOF、坏 SSE/二进制帧、未完成工具 JSON 都失败且不保存。上下文超限统一使用 `failed` 与 `context_length_exceeded`。压缩只在完整摘要成功后替换旧历史，有未完成工具时拒绝压缩。进程重启/多实例仍不共享内存状态，需同实例粘滞或回传完整历史。
+
+来源取舍与回归清单见 [集成审计](docs/stateful-integration-audit.md)。
 
 ### 已知限制
 

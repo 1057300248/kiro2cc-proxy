@@ -453,3 +453,99 @@ fn stream_openai_response(body: Body, converter: Box<dyn StreamConverter + Send>
         .body(Body::from_stream(out))
         .expect("构造 SSE 响应不会失败")
 }
+
+#[cfg(test)]
+mod transport_review_20261001 {
+    use super::*;
+    use crate::model::response_store::ResponseStore;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    fn event(name: &str, data: Value) -> String {
+        format!("event: {name}\ndata: {data}\n\n")
+    }
+    async fn consume(
+        chunks: Vec<Result<Bytes, std::io::Error>>,
+        converter: ResponsesStreamConverter,
+    ) -> String {
+        let response = stream_openai_response(
+            Body::from_stream(futures::stream::iter(chunks)),
+            Box::new(converter),
+        );
+        String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn malformed_frame_cannot_be_hidden_by_later_success() {
+        let data = event("message_start", json!({}))
+            + "event: content_block_delta\ndata: {broken}\n\n"
+            + &event("message_stop", json!({}));
+        let text = consume(
+            vec![Ok(Bytes::from(data))],
+            ResponsesStreamConverter::new("m", HashSet::new()),
+        )
+        .await;
+        assert!(text.contains("response.failed"));
+        assert!(!text.contains("response.completed"));
+    }
+    #[tokio::test]
+    async fn partial_eof_and_transport_error_never_persist() {
+        for transport_error in [false, true] {
+            let store = Arc::new(ResponseStore::default());
+            let converter = ResponsesStreamConverter::new("m", HashSet::new())
+                .with_persistence(store.persistence(1, Vec::new(), true).unwrap());
+            let data = event(
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"tool_use","id":"c","name":"f"}}),
+            ) + &event(
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"x\":"}}),
+            );
+            let mut chunks = vec![Ok(Bytes::from(data))];
+            if transport_error {
+                chunks.push(Err(std::io::Error::other("fixture interrupted")));
+            }
+            let text = consume(chunks, converter).await;
+            assert!(text.contains("response.failed"));
+            assert!(!text.contains("response.completed"));
+            assert!(!text.contains("response.function_call_arguments.done"));
+            let failed: Value = text
+                .lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .find(|v| v["type"] == "response.failed")
+                .unwrap();
+            assert!(
+                store
+                    .prepare_request(
+                        1,
+                        &json!({"previous_response_id":failed["response"]["id"],"input":"next"})
+                    )
+                    .is_err()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn split_success_finishes_once_and_drops_late_content() {
+        let data = event(
+            "content_block_start",
+            json!({"index":0,"content_block":{"type":"text","text":"answer"}}),
+        ) + &event("message_stop", json!({}))
+            + &event(
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"text_delta","text":"MUST_NOT_APPEAR"}}),
+            );
+        let chunks = data
+            .as_bytes()
+            .chunks(7)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        let text = consume(chunks, ResponsesStreamConverter::new("m", HashSet::new())).await;
+        assert_eq!(text.matches("event: response.completed\n").count(), 1);
+        assert!(!text.contains("MUST_NOT_APPEAR"));
+    }
+}

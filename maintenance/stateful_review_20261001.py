@@ -85,7 +85,7 @@ rep(p,'''                            // 转换为 SSE 字节流
                             }
                             // 转换为 SSE 字节流
                             let bytes''')
-rep(p,'Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, deadline, bridge, bridge_ctx, provider, round_in_flight)))','Some((stream::iter(bytes), (body_stream, ctx, decoder, decode_failed, ping_interval, deadline, bridge, bridge_ctx, provider, round_in_flight)))')
+rep(p,'Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, deadline, bridge, bridge_ctx, provider, round_in_flight)))\n                        }\n                        Some(Err(e)) => {','Some((stream::iter(bytes), (body_stream, ctx, decoder, decode_failed, ping_interval, deadline, bridge, bridge_ctx, provider, round_in_flight)))\n                        }\n                        Some(Err(e)) => {')
 rep(p,'''                        None => {
                             // 桥接态''','''                        None => {
                             if binary_stream_is_invalid(&decoder, true) {

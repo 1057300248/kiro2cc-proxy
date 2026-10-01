@@ -664,31 +664,29 @@ Model name can be `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-5.6-sol`, or any `clau
 
 ### Reverse proxy through new-api with a shared upstream key
 
-When new-api serves multiple downstream users but sends the same kiro2cc upstream API key for every request, pass a tenant identity as a separate header. Otherwise different users share the same `previous_response_id` namespace. Configure kiro2cc with:
+Set this in **Kiro's config.json**, not the New API request body override:
 
 ```json
-{
-  "responseStoreTenantHeader": "X-Kiro2CC-Tenant"
-}
+{"responseStoreTenantHeader":"X-Kiro2CC-Tenant"}
 ```
 
-Set the new-api channel's **Header Override** to:
+The equivalent Kiro environment variable is `RESPONSE_STORE_TENANT_HEADER=X-Kiro2CC-Tenant`. With the companion authenticated-tenant patch installed in New API, set its channel **Header Override** to:
 
 ```json
-{
-  "X-Kiro2CC-Tenant": "{client_header:Authorization}"
-}
+{"X-Kiro2CC-Tenant":"{authenticated_tenant}"}
 ```
 
-Set the channel Base URL to `http://kiro2cc:5678` without a `/v1` suffix. new-api's OpenAI adaptor appends `/v1/responses` or `/v1/chat/completions` for the selected request type. Configure the channel's model mapping to the model names supported by kiro2cc.
+The new placeholder derives an opaque HMAC scope from the server-authenticated user/token IDs, never from raw client headers. Different API tokens are isolated; alternate authentication header formats for the same verified token do not change its scope. Channel credential rotation changes the scope. Keep upstream Authorization set to the Kiro channel credential. Channel self-tests have a separate scope.
 
-`{client_header:Authorization}` reads the Authorization header received by new-api. kiro2cc stores only its SHA-256 hash as the continuation scope; the raw value is not written to logs or the in-memory store. If clients authenticate with `x-api-key`, use `{client_header:x-api-key}` instead. Keep the channel's `disable_store` setting off so `store=true` reaches kiro2cc.
+The companion patch is on `1057300248/wanchuan-new-api`, branch `codex/kiro-authenticated-tenant-20261001`. An unpatched gateway must not forward this placeholder literally. Do not use `{client_header:Authorization}`, `{client_header:x-api-key}`, or arbitrary client tenant headers as an ownership boundary.
 
-This header is a trusted-proxy signal, not an additional credential. Restrict kiro2cc to the new-api network and make new-api overwrite or filter the client-supplied header. Multi-instance deployments still need session stickiness because Responses state is process-local and is cleared on restart.
+Use the actual reachable listen address/port as the channel Base URL, without `/v1`; `5678` is only an example, not the application default. Keep `disable_store` off and use `store=true` for responses that need continuation. Only expose Kiro to trusted gateways/private networks; use protected transport across hosts. The tenant header is a namespace, not independent authentication or a request signature.
 
-When `responseStoreTenantHeader` is enabled, Responses requests without that header return HTTP 400. This fails closed instead of placing multiple users in one state namespace when the proxy is misconfigured.
+Missing, empty, duplicate, coalesced, or oversized tenant headers fail closed. Kiro usage/RPM/quota accounting remains aggregated under the shared upstream key; New API owns end-user billing and limits.
 
-The tenant header scopes Responses continuation history only. Usage, RPM, and spending records inside kiro2cc remain aggregated under the shared API key, so new-api should continue to enforce downstream authentication, limits, and billing.
+References never duplicate automatically restored output. Premature EOF, malformed SSE/binary frames, or incomplete tool JSON fail without saving a successful continuation. Context exhaustion uses `failed`/`context_length_exceeded`. Only a complete successful compaction replaces old history; unresolved tools block compaction. State remains process-local: restarts lose it and multiple instances require affinity or full-history replay.
+
+See [integration audit](docs/stateful-integration-audit.md) for donor decisions and regression boundaries.
 
 ### Known Limitations
 

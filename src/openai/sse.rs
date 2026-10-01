@@ -14,7 +14,7 @@
 //! - `event: ping` 是现有实现每 25s 注入的保活帧（`handlers.rs` 的 `create_ping_sse`），
 //!   属常规行为，静默丢弃且**不记录日志**，否则长连接会话会持续产生噪声
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// 静默丢弃的事件名（不下发给客户端、不记录 WARN、不计入未识别事件）
 const SILENT_EVENTS: &[&str] = &["ping"];
@@ -76,6 +76,9 @@ impl SseParser {
                 );
             }
             self.buf.clear();
+            items.push(malformed_sse(
+                "Upstream SSE buffer exceeded the safety limit.",
+            ));
         }
         items
     }
@@ -124,12 +127,24 @@ fn is_power_of_ten(n: u64) -> bool {
 }
 
 /// 解析单帧文本为 [`SseItem`]；返回 `None` 表示该帧应被丢弃
+fn malformed_sse(message: &str) -> SseItem {
+    SseItem::Event {
+        name: "error".to_string(),
+        data: json!({"error":{"type":"api_error","message":message}}),
+    }
+}
+
 fn parse_block(block: &[u8]) -> Option<SseItem> {
+    if block.len() > MAX_BUFFERED_BYTES {
+        return Some(malformed_sse(
+            "Upstream SSE frame exceeded the safety limit.",
+        ));
+    }
     let text = match std::str::from_utf8(block) {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!(error = %e, "SSE 帧不是合法 UTF-8，已跳过");
-            return None;
+            tracing::warn!(error = %e, "SSE 帧不是合法 UTF-8，终止响应");
+            return Some(malformed_sse("Upstream SSE frame is not valid UTF-8."));
         }
     };
 
@@ -158,7 +173,10 @@ fn parse_block(block: &[u8]) -> Option<SseItem> {
 
     if data_lines.is_empty() {
         if !event_name.is_empty() {
-            tracing::warn!(event = %event_name, "SSE 帧缺少 data 字段，已跳过");
+            tracing::warn!(event = %event_name, "SSE 帧缺少 data 字段，终止响应");
+            return Some(malformed_sse(
+                "Upstream SSE event is missing its data field.",
+            ));
         }
         return None;
     }
@@ -185,8 +203,8 @@ fn parse_block(block: &[u8]) -> Option<SseItem> {
             Some(SseItem::Event { name, data })
         }
         Err(e) => {
-            tracing::warn!(event = %event_name, error = %e, "SSE data 不是合法 JSON，已跳过");
-            None
+            tracing::warn!(event = %event_name, error = %e, "SSE data 不是合法 JSON，终止响应");
+            Some(malformed_sse("Upstream SSE data is not valid JSON."))
         }
     }
 }
@@ -291,7 +309,8 @@ mod tests {
         let mut p = SseParser::new();
         let items =
             p.push(b"event: bad\ndata: {not json}\n\nevent: ok\ndata: {\"type\":\"ok\"}\n\n");
-        assert_eq!(items, vec![ev("ok", json!({"type":"ok"}))]);
+        assert!(matches!(&items[0], SseItem::Event { name, .. } if name == "error"));
+        assert_eq!(items[1], ev("ok", json!({"type":"ok"})));
     }
 
     #[test]
@@ -320,7 +339,12 @@ mod tests {
         // 持续喂入不含帧边界的数据，缓冲区不得无界增长
         let chunk = vec![b'x'; 1024 * 1024];
         for _ in 0..20 {
-            assert!(p.push(&chunk).is_empty());
+            let items = p.push(&chunk);
+            assert!(
+                items
+                    .iter()
+                    .all(|item| matches!(item,SseItem::Event { name, .. } if name == "error"))
+            );
             // 每次 push 返回时缓冲区必已收敛到上限内（超限即在本次调用中清空）
             assert!(
                 p.buf.len() <= MAX_BUFFERED_BYTES,
@@ -336,11 +360,11 @@ mod tests {
     #[test]
     fn oversized_tail_after_valid_frame_is_dropped() {
         let mut p = SseParser::new();
-        // 单次喂入：合法帧 + 超限的无边界尾部。合法帧要正常产出，尾部要被丢弃
         let mut chunk = b"event: a\ndata: {\"type\":\"a\"}\n\n".to_vec();
         chunk.extend(std::iter::repeat_n(b'x', MAX_BUFFERED_BYTES + 1));
         let items = p.push(&chunk);
-        assert_eq!(items, vec![ev("a", json!({"type":"a"}))]);
-        assert!(p.buf.is_empty(), "超限尾部应在本次 push 内即被丢弃");
+        assert_eq!(items[0], ev("a", json!({"type":"a"})));
+        assert!(matches!(&items[1],SseItem::Event { name,.. } if name == "error"));
+        assert!(p.buf.is_empty());
     }
 }
