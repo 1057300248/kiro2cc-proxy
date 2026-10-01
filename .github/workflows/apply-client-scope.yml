@@ -1,0 +1,97 @@
+name: Apply Kiro-only Client Scope
+
+on:
+  push:
+    branches: ['codex/stateful-responses-20260930']
+    paths:
+      - 'maintenance/apply_client_scope.py'
+      - '.github/workflows/apply-client-scope.yml'
+      - 'src/model/client_auth_scope*.rs'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: apply-kiro-only-client-scope
+  cancel-in-progress: true
+
+jobs:
+  verify-and-publish:
+    if: github.repository == '1057300248/kiro2cc-proxy' && github.event_name == 'push'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Apply exact Kiro integration
+        run: |
+          git merge-base --is-ancestor f5958804a04f3e74f2caf1dd3c87bebd1830efd9 HEAD
+          python3 maintenance/apply_client_scope.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: Build embedded UIs
+        run: |
+          (cd admin-ui && pnpm install && pnpm build)
+          (cd user-ui && npm install && npm run build)
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format and record exact candidate
+        run: |
+          cargo fmt --all
+          git add --pathspec-from-file=.client-scope-changed-paths
+          git diff --cached --check
+          git diff --cached > client-scope-source.patch
+          git diff --exit-code -- Cargo.toml Cargo.lock
+      - name: Type check
+        run: cargo check --locked --all-targets 2>&1 | tee client-scope-check.log
+      - name: Clippy
+        run: cargo clippy --locked --all-targets 2>&1 | tee client-scope-clippy.log
+      - name: Complete regression suite
+        run: cargo test --locked 2>&1 | tee client-scope-tests.log
+      - name: Release build
+        run: cargo build --release --locked 2>&1 | tee client-scope-release.log
+      - name: Publish validated source to this branch only
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          branch=codex/stateful-responses-20260930
+          remote=$(git ls-remote origin "refs/heads/$branch" | cut -f1)
+          test "$remote" = "$EXPECTED_SHA"
+          git diff --exit-code
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat: 完成 Kiro 独立客户身份隔离与零 New API 补丁接入'
+          git push origin "HEAD:refs/heads/$branch"
+          git rev-parse HEAD > client-scope-published-sha.txt
+          sha256sum target/release/kiro2cc-proxy > client-scope-release-sha256.txt
+          cat client-scope-published-sha.txt
+          grep '^test result:' client-scope-tests.log
+      - name: Record failures and final status
+        if: always()
+        run: |
+          git diff > client-scope-unstaged.patch
+          git status --short > client-scope-status.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kiro-client-scope-evidence-${{ github.run_id }}
+          path: |
+            client-scope-*.log
+            client-scope-*.patch
+            client-scope-*.txt
+          retention-days: 7
