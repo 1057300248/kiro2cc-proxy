@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: stateful-review-${{ github.ref }}
   cancel-in-progress: true
@@ -23,6 +27,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -40,10 +46,31 @@ jobs:
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Type check
-        run: cargo check --locked --all-targets
+        run: cargo check --locked --all-targets 2>&1 | tee validation-check.log
       - name: Clippy
-        run: cargo clippy --locked --all-targets
+        run: cargo clippy --locked --all-targets 2>&1 | tee validation-clippy.log
       - name: Regression tests
-        run: cargo test --locked
+        run: cargo test --locked 2>&1 | tee validation-tests.log
       - name: Release build
-        run: cargo build --release --locked
+        run: cargo build --release --locked 2>&1 | tee validation-release.log
+      - name: Record source and artifact identity
+        run: |
+          git rev-parse HEAD > validation-source.txt
+          sha256sum target/release/kiro2cc-proxy > validation-release-sha256.txt
+          git diff --exit-code -- Cargo.toml Cargo.lock
+          {
+            echo '## Verified source'
+            cat validation-source.txt
+            echo '## Test result'
+            grep '^test result:' validation-tests.log
+            echo '## Linux release checksum'
+            cat validation-release-sha256.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stateful-validation-${{ github.run_id }}
+          path: |
+            validation-*.log
+            validation-*.txt
+          retention-days: 7
