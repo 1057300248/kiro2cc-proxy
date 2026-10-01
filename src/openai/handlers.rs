@@ -35,9 +35,13 @@ use super::sse::{SseItem, SseParser};
 trait StreamConverter {
     fn on_event(&mut self, name: &str, data: &Value) -> Vec<String>;
     fn finish(&mut self) -> Vec<String>;
+    fn is_finished(&self) -> bool;
 }
 
 impl StreamConverter for ChatStreamConverter {
+    fn is_finished(&self) -> bool {
+        ChatStreamConverter::is_finished(self)
+    }
     fn on_event(&mut self, name: &str, data: &Value) -> Vec<String> {
         ChatStreamConverter::on_event(self, name, data)
     }
@@ -48,6 +52,9 @@ impl StreamConverter for ChatStreamConverter {
 }
 
 impl StreamConverter for ResponsesStreamConverter {
+    fn is_finished(&self) -> bool {
+        ResponsesStreamConverter::is_finished(self)
+    }
     fn on_event(&mut self, name: &str, data: &Value) -> Vec<String> {
         ResponsesStreamConverter::on_event(self, name, data)
     }
@@ -379,6 +386,9 @@ fn stream_openai_response(body: Body, converter: Box<dyn StreamConverter + Send>
                             for frame in converter.on_event(&name, &data) {
                                 buf.push_str(&frame);
                             }
+                            if converter.is_finished() {
+                                break;
+                            }
                         }
                         // SseItem::Done：Anthropic 侧不发，收到也无需转发
                     }
@@ -386,9 +396,14 @@ fn stream_openai_response(body: Body, converter: Box<dyn StreamConverter + Send>
                         // 本次 chunk 只含半帧或 ping，继续等下一块
                         continue;
                     }
+                    let next = if converter.is_finished() {
+                        None
+                    } else {
+                        Some((ds, parser, converter))
+                    };
                     return Some((
                         Ok::<Bytes, std::convert::Infallible>(Bytes::from(buf)),
-                        Some((ds, parser, converter)),
+                        next,
                     ));
                 }
                 Some(Err(e)) => {

@@ -138,11 +138,12 @@ impl AppState {
 /// as part of a continuation-store key. The raw upstream credential never
 /// enters the store key or logs.
 fn response_store_scope(request: &Request<Body>, header_name: Option<&str>) -> Option<String> {
-    let value = header_name
-        .and_then(|name| request.headers().get(name))
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
+    let name = header_name?;
+    let mut values = request.headers().get_all(name).iter();
+    let value = values.next()?.to_str().ok()?.trim();
+    if values.next().is_some() || value.is_empty() || value.len() > 1024 || value.contains(',') {
+        return None;
+    }
     let digest = Sha256::digest(value.as_bytes());
     Some(format!("sha256:{digest:x}"))
 }
@@ -304,5 +305,18 @@ mod tests {
             state.response_store_tenant_header.as_deref(),
             Some("x-kiro2cc-tenant")
         );
+    }
+}
+#[cfg(test)]
+mod review_20261001 {
+    use super::*;
+    #[test]
+    fn duplicate_and_coalesced_tenant_headers_are_rejected() {
+        let mut req = Request::builder().body(Body::empty()).unwrap();
+        req.headers_mut().append("x-tenant", "a".parse().unwrap());
+        req.headers_mut().append("x-tenant", "b".parse().unwrap());
+        assert!(response_store_scope(&req, Some("x-tenant")).is_none());
+        req.headers_mut().insert("x-tenant", "a,b".parse().unwrap());
+        assert!(response_store_scope(&req, Some("x-tenant")).is_none());
     }
 }

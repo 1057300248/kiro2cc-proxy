@@ -28,7 +28,7 @@ def rep(path, old, new, count=1):
 def method(path, name, replacement, indent=4):
     text = Path(path).read_text(encoding='utf-8')
     prefix = ' ' * indent
-    start = re.search(rf'(?m)^{prefix}(?:pub\(crate\) )?fn {re.escape(name)}\(', text)
+    start = re.search(rf'(?m)^{prefix}(?:pub\((?:crate|super)\) )?fn {re.escape(name)}\(', text)
     if not start:
         raise RuntimeError(f'{path}: missing function {name}')
     end = re.search(rf'(?m)^{prefix}\}}', text[start.end():])

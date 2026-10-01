@@ -521,16 +521,14 @@ mod tests {
     #[test]
     fn truncated_tool_stream_infers_tool_calls_finish_reason() {
         let mut conv = ChatStreamConverter::new("m", false);
-        let mut frames = conv.on_event("message_start", &json!({}));
-        frames.extend(conv.on_event(
+        conv.on_event(
             "content_block_start",
-            &json!({"index": 1, "content_block": {
-                "type": "tool_use", "id": "t1", "name": "f", "input": {}
-            }}),
-        ));
-        frames.extend(conv.finish());
-        let finish = parse_frame(&frames[frames.len() - 2]).unwrap();
-        assert_eq!(finish["choices"][0]["finish_reason"], "tool_calls");
+            &json!({"index":0,"content_block":{"type":"tool_use","id":"c","name":"f"}}),
+        );
+        let frames = conv.finish();
+        assert!(parse_frame(&frames[0]).unwrap().get("error").is_some());
+        assert!(!frames.concat().contains("\"finish_reason\":\"tool_calls\""));
+        assert_eq!(frames.last().unwrap(), "data: [DONE]\n\n");
     }
 
     #[test]
@@ -544,7 +542,7 @@ mod tests {
                 "cache_creation_input_tokens": 2
             }}}),
         );
-        frames.extend(conv.finish());
+        frames.extend(conv.on_event("message_stop", &json!({})));
         let usage = parse_frame(&frames[frames.len() - 2]).unwrap();
         assert_eq!(usage["usage"]["prompt_tokens"], 16);
         assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
@@ -558,7 +556,7 @@ mod tests {
             &json!({"message": {"usage": {"input_tokens": 10}}}),
         );
         conv.on_event("message_delta", &json!({"usage": {"output_tokens": 3}}));
-        let frames = conv.finish();
+        let frames = conv.on_event("message_stop", &json!({}));
         let usage = parse_frame(&frames[frames.len() - 2]).unwrap()["usage"].clone();
         assert_eq!(usage["prompt_tokens"], 10);
         assert_eq!(usage["completion_tokens"], 3);
@@ -614,17 +612,9 @@ mod tests {
 
     #[test]
     fn truncated_stream_still_gets_finish_and_done() {
-        // 上游只发了 message_start 就断开
         let frames = run_stream(&[("message_start", json!({}))], false);
         assert_eq!(frames.len(), 3);
-        assert_eq!(
-            parse_frame(&frames[0]).unwrap()["choices"][0]["delta"]["role"],
-            "assistant"
-        );
-        assert_eq!(
-            parse_frame(&frames[1]).unwrap()["choices"][0]["finish_reason"],
-            "stop"
-        );
+        assert!(parse_frame(&frames[1]).unwrap().get("error").is_some());
         assert_eq!(frames[2], "data: [DONE]\n\n");
     }
 

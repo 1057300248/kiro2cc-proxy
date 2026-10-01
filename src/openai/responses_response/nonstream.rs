@@ -325,9 +325,21 @@ fn convert_non_stream_inner(
         response["status"] = json!("incomplete");
         response["incomplete_details"] = json!({"reason": "max_output_tokens"});
     } else if is_context_exceeded(stop_reason) {
-        response["status"] = json!("incomplete");
-        response["incomplete_details"] = json!({"reason": "context_window_exceeded"});
+        response["status"] = json!("failed");
+        response["error"] = json!({"type": "invalid_request_error", "code": "context_length_exceeded", "message": "Conversation context exceeded the model's context window. Compact the conversation or start a new one, then retry."});
     }
 
+    if is_compaction
+        && (is_truncated(stop_reason)
+            || response["output"][0]["encrypted_content"].as_str() == Some(""))
+    {
+        response["status"] = json!("failed");
+        response
+            .as_object_mut()
+            .unwrap()
+            .remove("incomplete_details");
+        response["error"] = json!({"type":"server_error", "code":"compaction_failed", "message":"Context compaction did not produce a complete, usable summary."});
+        response["output"] = json!([]);
+    }
     response
 }

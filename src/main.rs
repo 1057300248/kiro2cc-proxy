@@ -199,6 +199,14 @@ async fn main() {
         .with_rpm_tracker(rpm_tracker.clone())
         .with_fingerprint_tracker(fingerprint_tracker.clone());
     if let Some(header_name) = config.response_store_tenant_header.as_deref() {
+        if header_name.trim().is_empty()
+            || http::header::HeaderName::from_bytes(header_name.trim().as_bytes()).is_err()
+        {
+            tracing::error!(
+                "Invalid responseStoreTenantHeader; refusing to disable isolation silently"
+            );
+            std::process::exit(1);
+        }
         anthropic_app_state =
             anthropic_app_state.with_response_store_tenant_header(header_name.to_string());
         tracing::info!(

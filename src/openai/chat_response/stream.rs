@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use crate::openai::stream_integrity::StreamIntegrity;
 use serde_json::{Value, json};
 
 use super::nonstream::{convert_usage, map_finish_reason, new_completion_id, unix_now};
@@ -32,6 +33,7 @@ pub(crate) struct ChatStreamConverter {
     role_sent: bool,
     finish_sent: bool,
     done_sent: bool,
+    integrity: StreamIntegrity,
     /// Anthropic block index → OpenAI tool_calls index
     tool_index_by_block: std::collections::HashMap<i64, usize>,
     next_tool_index: usize,
@@ -63,6 +65,7 @@ impl ChatStreamConverter {
             role_sent: false,
             finish_sent: false,
             done_sent: false,
+            integrity: StreamIntegrity::default(),
             tool_index_by_block: std::collections::HashMap::new(),
             next_tool_index: 0,
             finish_reason: "stop",
@@ -73,8 +76,18 @@ impl ChatStreamConverter {
         }
     }
 
+    pub(crate) fn is_finished(&self) -> bool {
+        self.done_sent
+    }
+
     /// 处理一个上游事件，返回待下发的 SSE 帧
     pub(crate) fn on_event(&mut self, name: &str, data: &Value) -> Vec<String> {
+        if self.done_sent {
+            return Vec::new();
+        }
+        if let Err(message) = self.integrity.observe(name, data) {
+            return self.on_error(&json!({"error": {"type": "api_error", "message": message}}));
+        }
         match name {
             "message_start" => {
                 let frames = self.ensure_role_frame();
@@ -140,6 +153,9 @@ impl ChatStreamConverter {
         let mut frames = Vec::new();
         if self.done_sent {
             return frames;
+        }
+        if !self.integrity.stopped {
+            return self.on_error(&json!({"error": {"type": "api_error", "message": "Upstream stream ended before message_stop."}}));
         }
         // 极端情况下上游一个内容块都没给，仍要让客户端看到合法的 chunk 序列
         frames.extend(self.ensure_role_frame());

@@ -26,6 +26,7 @@ mod model_map;
 mod responses_request;
 mod responses_response;
 mod sse;
+mod stream_integrity;
 
 pub(crate) use handlers::{post_chat_completions, post_responses};
 

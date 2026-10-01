@@ -47,37 +47,25 @@ pub(crate) struct ConvertedChatRequest {
 }
 
 const MAX_KIRO_TOOL_NAME_CHARS: usize = 64;
-const TOOL_NAME_HASH_CHARS: usize = 12;
 
 /// Kiro ToolSpecification.name 最长 64 字符，且只接受 ASCII 字母数字、下划线和连字符。
 /// 不满足约束时生成稳定的安全别名；响应侧再用映射恢复客户端原名。
 pub(super) fn kiro_tool_name(name: &str) -> String {
+    const PREFIX: &str = "kiro2cc_";
     let safe = !name.is_empty()
-        && name.chars().count() <= MAX_KIRO_TOOL_NAME_CHARS
+        && name.len() <= MAX_KIRO_TOOL_NAME_CHARS
+        && !name.to_ascii_lowercase().starts_with(PREFIX)
         && name
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
     if safe {
         return name.to_string();
     }
-
     let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
-    let prefix_chars = MAX_KIRO_TOOL_NAME_CHARS - TOOL_NAME_HASH_CHARS - 2;
-    let mut prefix: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(prefix_chars)
-        .collect();
-    if prefix.chars().all(|c| c == '_') {
-        prefix = "kiro_tool".to_string();
-    }
-    format!("{prefix}__{}", &digest[..TOOL_NAME_HASH_CHARS])
+    format!(
+        "{PREFIX}{}",
+        &digest[..MAX_KIRO_TOOL_NAME_CHARS - PREFIX.len()]
+    )
 }
 
 fn register_tool_alias(
@@ -1071,5 +1059,18 @@ mod tests {
             r.anthropic_body["messages"],
             json!([{"role": "user", "content": [{"type": "text", "text": "orphan"}]}])
         );
+    }
+}
+#[cfg(test)]
+mod review_20261001 {
+    use super::*;
+    #[test]
+    fn aliases_cannot_impersonate_real_tool_names_or_case_variants() {
+        let original = "long/invalid/name";
+        let alias = kiro_tool_name(original);
+        assert_ne!(kiro_tool_name(&alias), alias);
+        assert_ne!(kiro_tool_name("Read"), kiro_tool_name("read"));
+        assert_eq!(kiro_tool_name("read"), "read");
+        assert!(alias.len() <= 64);
     }
 }

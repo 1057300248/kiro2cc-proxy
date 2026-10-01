@@ -29,7 +29,7 @@ struct StoreKey {
 
 #[derive(Clone, Debug)]
 struct StoredResponse {
-    history: Vec<Value>,
+    history: Arc<Vec<Value>>,
     /// 本响应 output items 在累计 history 中的起始下标。
     output_start: usize,
     expires_at: Instant,
@@ -139,7 +139,7 @@ impl ResponseStore {
         };
         let previous_history = previous
             .as_ref()
-            .map(|stored| stored.history.clone())
+            .map(|stored| stored.history.as_ref().clone())
             .unwrap_or_default();
 
         let current = normalize_input_items(object.get("input"))?;
@@ -150,13 +150,22 @@ impl ResponseStore {
                 .map(|stored| &stored.history[stored.output_start..]),
         )?;
 
-        let mut conversion_input = previous_history.clone();
-        conversion_input.extend(current.iter().cloned());
+        let mut conversion_input = previous_history;
+        append_unique_items(&mut conversion_input, current)?;
+        if conversion_input
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"))
+            && has_pending_tools(&conversion_input)
+        {
+            return Err("Cannot compact a conversation with unresolved tool calls; provide their outputs first.".to_string());
+        }
+        let history = conversion_input
+            .iter()
+            .filter(|item| is_history_item(item))
+            .cloned()
+            .collect();
         object.insert("input".to_string(), Value::Array(conversion_input));
         object.remove("previous_response_id");
-
-        let mut history = previous_history;
-        history.extend(current.into_iter().filter(is_history_item));
 
         Ok(PreparedResponsesRequest {
             body: prepared,
@@ -225,11 +234,38 @@ impl ResponseStore {
             tracing::warn!("Responses store: response 缺少 id，跳过保存");
             return;
         };
-        if response.get("status").and_then(Value::as_str) == Some("failed") {
+        if !matches!(
+            response.get("status").and_then(Value::as_str),
+            Some("completed") | Some("incomplete")
+        ) {
             return;
         }
-
-        let mut history = base_history.to_vec();
+        let compacted = response
+            .get("output")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.len() == 1
+                    && items[0].get("type").and_then(Value::as_str) == Some("compaction")
+            });
+        if compacted && response.get("status").and_then(Value::as_str) != Some("completed") {
+            return;
+        }
+        let mut history = if compacted {
+            // Preserve explicit conversation-level system/developer messages only.
+            // Top-level instructions are per-request and are deliberately not inherited.
+            base_history
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item.get("role").and_then(Value::as_str),
+                        Some("system") | Some("developer")
+                    )
+                })
+                .cloned()
+                .collect()
+        } else {
+            base_history.to_vec()
+        };
         let output_start = history.len();
         if let Some(output) = response.get("output").and_then(Value::as_array) {
             history.extend(output.iter().filter(|item| is_history_item(item)).cloned());
@@ -286,7 +322,7 @@ impl ResponseStore {
         inner.entries.insert(
             key,
             StoredResponse {
-                history,
+                history: Arc::new(history),
                 output_start,
                 expires_at: now + self.ttl,
                 size_bytes,
@@ -353,7 +389,7 @@ fn resolve_item_references(
             .filter(|id| !id.is_empty())
             .ok_or_else(|| "item_reference.id 缺失或为空".to_string())?;
 
-        let referenced = previous_output
+        let _referenced = previous_output
             .iter()
             .rev()
             .find(|candidate| {
@@ -362,9 +398,78 @@ fn resolve_item_references(
             })
             .cloned()
             .ok_or_else(|| format!("未知的 item_reference id: {id}"))?;
-        resolved.push(referenced);
+        // Already included by previous_response_id; validate, but never replay twice.
     }
     Ok(resolved)
+}
+
+fn item_keys(item: &Value) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(id) = item
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        keys.push(format!("id:{id}"));
+    }
+    let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    let prefix = match kind {
+        "function_call" | "custom_tool_call" => Some("call"),
+        "function_call_output" | "custom_tool_call_output" => Some("result"),
+        _ => None,
+    };
+    if let (Some(prefix), Some(id)) = (prefix, item.get("call_id").and_then(Value::as_str)) {
+        keys.push(format!("{prefix}:{id}"));
+    }
+    keys
+}
+
+fn append_unique_items(history: &mut Vec<Value>, current: Vec<Value>) -> Result<(), String> {
+    let mut known: HashMap<String, usize> = HashMap::new();
+    for (index, item) in history.iter().enumerate() {
+        for key in item_keys(item) {
+            known.insert(key, index);
+        }
+    }
+    for item in current {
+        let keys = item_keys(&item);
+        let mut duplicate = false;
+        for key in &keys {
+            if let Some(&index) = known.get(key) {
+                if history[index] != item {
+                    return Err("Conflicting duplicate item or tool call ID in input.".to_string());
+                }
+                duplicate = true;
+            }
+        }
+        if !duplicate {
+            let index = history.len();
+            for key in keys {
+                known.insert(key, index);
+            }
+            history.push(item);
+        }
+    }
+    Ok(())
+}
+
+fn has_pending_tools(items: &[Value]) -> bool {
+    let mut pending = std::collections::HashSet::new();
+    for item in items {
+        let Some(id) = item.get("call_id").and_then(Value::as_str) else {
+            continue;
+        };
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") | Some("custom_tool_call") => {
+                pending.insert(id);
+            }
+            Some("function_call_output") | Some("custom_tool_call_output") => {
+                pending.remove(id);
+            }
+            _ => {}
+        }
+    }
+    !pending.is_empty()
 }
 
 fn is_history_item(item: &Value) -> bool {
@@ -710,5 +815,128 @@ mod tests {
                 .persistence(7, disabled.history, disabled.store_response)
                 .is_none()
         );
+    }
+}
+#[cfg(test)]
+mod review_20261001 {
+    use super::*;
+    fn store() -> Arc<ResponseStore> {
+        Arc::new(ResponseStore::default())
+    }
+    fn seed(s: &Arc<ResponseStore>, scope: &str, output: Value) {
+        s.persistence_with_scope(
+            7,
+            Some(scope),
+            vec![json!({"role":"user","content":"first"})],
+            true,
+        )
+        .unwrap()
+        .persist(&json!({"id":"resp_seed","status":"completed","output":[output]}));
+    }
+    #[test]
+    fn references_do_not_repeat_calls_or_messages() {
+        for item in [
+            json!({"id":"i","type":"message","role":"assistant","content":"answer"}),
+            json!({"id":"i","type":"function_call","call_id":"c","name":"f","arguments":"{}"}),
+            json!({"id":"i","type":"custom_tool_call","call_id":"c","name":"f","input":"x"}),
+        ] {
+            let s = store();
+            seed(&s, "a", item);
+            let prepared = s.prepare_request_with_scope(7,Some("a"),&json!({"input":[{"type":"item_reference","id":"i"},{"role":"user","content":"next"}],"previous_response_id":"resp_seed"})).unwrap();
+            assert_eq!(
+                prepared.body["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|v| v["id"] == "i")
+                    .count(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn conflicting_tool_id_is_rejected_but_repeated_text_is_kept() {
+        let mut history =
+            vec![json!({"type":"function_call","call_id":"c","name":"f","arguments":"{}"})];
+        let same = history[0].clone();
+        append_unique_items(&mut history, vec![same]).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(
+            append_unique_items(
+                &mut history,
+                vec![json!({"type":"function_call","call_id":"c","name":"g","arguments":"{}"})]
+            )
+            .is_err()
+        );
+        append_unique_items(
+            &mut history,
+            vec![
+                json!({"role":"user","content":"again"}),
+                json!({"role":"user","content":"again"}),
+            ],
+        )
+        .unwrap();
+        assert_eq!(history.len(), 3);
+    }
+    #[test]
+    fn compacted_snapshot_replaces_old_history() {
+        let s = store();
+        let history = vec![
+            json!({"role":"developer","content":"rules"}),
+            json!({"role":"user","content":"large old transcript"}),
+        ];
+        s.persistence(7,history,true).unwrap().persist(&json!({"id":"compact","status":"completed","output":[{"type":"compaction","id":"cmp","encrypted_content":"c3VtbWFyeQ=="}]}));
+        let p = s
+            .prepare_request(7, &json!({"previous_response_id":"compact","input":"next"}))
+            .unwrap();
+        assert!(!p.body.to_string().contains("large old transcript"));
+        assert!(p.body.to_string().contains("rules"));
+        assert_eq!(p.body["input"].as_array().unwrap().len(), 3);
+    }
+    #[test]
+    fn compaction_rejects_unresolved_tools() {
+        let s = store();
+        seed(
+            &s,
+            "a",
+            json!({"type":"function_call","id":"i","call_id":"c","name":"f","arguments":"{}"}),
+        );
+        assert!(
+            s.prepare_request_with_scope(
+                7,
+                Some("a"),
+                &json!({"previous_response_id":"resp_seed","input":[{"type":"compaction_trigger"}]})
+            )
+            .is_err()
+        );
+        assert!(s.prepare_request_with_scope(7,Some("a"),&json!({"previous_response_id":"resp_seed","input":[{"type":"function_call_output","call_id":"c","output":"done"},{"type":"compaction_trigger"}]})).is_ok());
+    }
+    #[test]
+    fn scoped_history_cannot_fall_back_to_unscoped_namespace() {
+        let s = store();
+        seed(&s, "a", json!({"role":"assistant","content":"answer"}));
+        for scope in [None, Some("b")] {
+            assert!(
+                s.prepare_request_with_scope(
+                    7,
+                    scope,
+                    &json!({"previous_response_id":"resp_seed","input":"x"})
+                )
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn unfinished_and_failed_responses_are_not_saved() {
+        let s = store();
+        for status in ["in_progress", "failed", "queued"] {
+            s.persistence(7, Vec::new(), true)
+                .unwrap()
+                .persist(&json!({"id":status,"status":status,"output":[]}));
+            assert!(
+                s.prepare_request(7, &json!({"previous_response_id":status,"input":"x"}))
+                    .is_err()
+            );
+        }
     }
 }
