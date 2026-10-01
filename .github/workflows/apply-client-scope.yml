@@ -54,6 +54,31 @@ jobs:
       - uses: pnpm/action-setup@v4
         with:
           version: 9
+      - name: Pin a published Rollup and matching Linux native package
+        run: |
+          ROLLUP_PIN=$(npm view '@rollup/rollup-linux-x64-gnu@4' version --json | node -e '
+            let s=""; process.stdin.on("data",c=>s+=c).on("end",()=>{
+              const data=JSON.parse(s); const versions=(Array.isArray(data)?data:[data]).filter(v=>/^4\.\d+\.\d+$/.test(v));
+              versions.sort((a,b)=>{ const x=a.split(".").map(Number), y=b.split(".").map(Number); return x[1]-y[1] || x[2]-y[2]; });
+              if(!versions.length) process.exit(1); process.stdout.write(versions.at(-1));
+            });')
+          test "$(npm view "rollup@$ROLLUP_PIN" version)" = "$ROLLUP_PIN"
+          export ROLLUP_PIN
+          node - <<'JS'
+          const fs=require('node:fs');
+          for (const directory of ['admin-ui','user-ui']) {
+            const file=`${directory}/package.json`;
+            const data=JSON.parse(fs.readFileSync(file,'utf8'));
+            if(directory==='admin-ui') {
+              data.pnpm={...data.pnpm,overrides:{...data.pnpm?.overrides,rollup:process.env.ROLLUP_PIN}};
+            } else {
+              data.overrides={...data.overrides,rollup:process.env.ROLLUP_PIN};
+            }
+            fs.writeFileSync(file,JSON.stringify(data,null,2)+'\n');
+          }
+          JS
+          printf '%s\n' admin-ui/package.json user-ui/package.json >> .client-scope-changed-paths
+          printf 'Rollup and native package pin: %s\n' "$ROLLUP_PIN" | tee client-scope-build-pin.txt
       - name: Build embedded UIs
         run: |
           (cd admin-ui && pnpm install && node ../.github/scripts/ensure-rollup-native.cjs && pnpm build)
