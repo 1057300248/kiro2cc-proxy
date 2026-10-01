@@ -20,7 +20,7 @@
 //! 顺序一致），但不带 `encrypted_content`——本代理产不出可回传的加密推理内容，客户端
 //! 把它原样回传时会被 [`super::responses_request`] 静默丢弃。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -52,14 +52,14 @@ pub(crate) fn compaction_item(summary_text: &str) -> Value {
 
 /// 上游 `stop_reason` 是否表示输出被截断
 ///
-/// 两种取值都来自 `src/anthropic/handlers.rs`：`max_tokens` 是命中 `max_tokens` 上限，
-/// `model_context_window_exceeded` 是上下文窗口耗尽。对 Responses 客户端而言两者都是
-/// "没写完就停了"，统一映射为 `max_output_tokens`。
+/// 上游 stop_reason 是否表示输出 token 上限导致的截断。
 pub(crate) fn is_truncated(stop_reason: Option<&str>) -> bool {
-    matches!(
-        stop_reason,
-        Some("max_tokens") | Some("model_context_window_exceeded")
-    )
+    matches!(stop_reason, Some("max_tokens"))
+}
+
+/// 上游 stop_reason 是否表示上下文窗口耗尽。
+pub(crate) fn is_context_exceeded(stop_reason: Option<&str>) -> bool {
+    matches!(stop_reason, Some("model_context_window_exceeded"))
 }
 
 /// 把 Anthropic 的 usage 换算为 Responses usage（字段名与 Chat Completions 不同）
@@ -96,7 +96,11 @@ struct ExtractedContent {
 ///
 /// `thinking` 块的 `signature` 字段是为通过下游检测伪造的无语义串
 /// （`src/anthropic/stream.rs` 的 `generate_fake_signature`），只取 `thinking` 文本。
-fn extract_content(content: Option<&Value>, custom_tools: &HashSet<String>) -> ExtractedContent {
+fn extract_content(
+    content: Option<&Value>,
+    custom_tools: &HashSet<String>,
+    tool_name_map: &HashMap<String, String>,
+) -> ExtractedContent {
     let mut out = ExtractedContent::default();
     let Some(blocks) = content.and_then(Value::as_array) else {
         return out;
@@ -119,7 +123,7 @@ fn extract_content(content: Option<&Value>, custom_tools: &HashSet<String>) -> E
                 }
             }
             "tool_use" => {
-                if let Some(call) = tool_use_to_item(block, custom_tools) {
+                if let Some(call) = tool_use_to_item(block, custom_tools, tool_name_map) {
                     out.tool_calls.push(call);
                 }
             }
@@ -136,7 +140,11 @@ fn extract_content(content: Option<&Value>, custom_tools: &HashSet<String>) -> E
 ///
 /// `call_id` 直接用上游的 `tool_use.id`：客户端下一轮会以该值回传
 /// `function_call_output`，请求侧再原样还原为 `tool_result.tool_use_id`。
-fn tool_use_to_item(block: &Value, custom_tools: &HashSet<String>) -> Option<Value> {
+fn tool_use_to_item(
+    block: &Value,
+    custom_tools: &HashSet<String>,
+    tool_name_map: &HashMap<String, String>,
+) -> Option<Value> {
     let id = block.get("id").and_then(Value::as_str);
     let name = block.get("name").and_then(Value::as_str);
     // 缺字段的块只能跳过，但必须留痕：否则客户端收到的响应会莫名少一次工具调用且无从排查
@@ -149,12 +157,14 @@ fn tool_use_to_item(block: &Value, custom_tools: &HashSet<String>) -> Option<Val
         return None;
     };
 
+    let client_name = tool_name_map.get(name).map(String::as_str).unwrap_or(name);
+
     if custom_tools.contains(name) {
         return Some(json!({
             "type": "custom_tool_call",
             "id": new_id("ctc"),
             "call_id": id,
-            "name": name,
+            "name": client_name,
             "input": custom_input_from_value(block.get("input")),
             "status": "completed",
         }));
@@ -170,7 +180,7 @@ fn tool_use_to_item(block: &Value, custom_tools: &HashSet<String>) -> Option<Val
         "type": "function_call",
         "id": new_id("fc"),
         "call_id": id,
-        "name": name,
+        "name": client_name,
         "arguments": arguments,
         "status": "completed",
     }))
@@ -220,33 +230,59 @@ fn reasoning_item(text: &str) -> Value {
 }
 
 /// 把 Anthropic 非流式响应转换为 Responses `response` 对象
+#[allow(dead_code)] // retained as a stable test/convenience entry point
 pub(crate) fn convert_non_stream(
     anthropic: &Value,
     client_model: &str,
     custom_tools: &HashSet<String>,
 ) -> Value {
-    convert_non_stream_inner(anthropic, client_model, custom_tools, false)
+    convert_non_stream_with_tool_name_map(anthropic, client_model, custom_tools, &HashMap::new())
+}
+
+pub(crate) fn convert_non_stream_with_tool_name_map(
+    anthropic: &Value,
+    client_model: &str,
+    custom_tools: &HashSet<String>,
+    tool_name_map: &HashMap<String, String>,
+) -> Value {
+    convert_non_stream_inner(anthropic, client_model, custom_tools, tool_name_map, false)
 }
 
 /// 把 Anthropic 非流式响应转换为 Responses `response` 对象（压缩模式）
 ///
 /// 当 `is_compaction=true` 时，将模型返回的文本内容包装为 `type: "compaction"` output item，
 /// 满足 Codex remote compaction v2 的协议要求（恰好一个 compaction output item）。
+#[allow(dead_code)] // retained as a stable test/convenience entry point
 pub(crate) fn convert_non_stream_compaction(
     anthropic: &Value,
     client_model: &str,
     custom_tools: &HashSet<String>,
 ) -> Value {
-    convert_non_stream_inner(anthropic, client_model, custom_tools, true)
+    convert_non_stream_compaction_with_tool_name_map(
+        anthropic,
+        client_model,
+        custom_tools,
+        &HashMap::new(),
+    )
+}
+
+pub(crate) fn convert_non_stream_compaction_with_tool_name_map(
+    anthropic: &Value,
+    client_model: &str,
+    custom_tools: &HashSet<String>,
+    tool_name_map: &HashMap<String, String>,
+) -> Value {
+    convert_non_stream_inner(anthropic, client_model, custom_tools, tool_name_map, true)
 }
 
 fn convert_non_stream_inner(
     anthropic: &Value,
     client_model: &str,
     custom_tools: &HashSet<String>,
+    tool_name_map: &HashMap<String, String>,
     is_compaction: bool,
 ) -> Value {
-    let extracted = extract_content(anthropic.get("content"), custom_tools);
+    let extracted = extract_content(anthropic.get("content"), custom_tools, tool_name_map);
     let stop_reason = anthropic.get("stop_reason").and_then(Value::as_str);
 
     let mut output = Vec::new();
@@ -288,7 +324,22 @@ fn convert_non_stream_inner(
     if is_truncated(stop_reason) {
         response["status"] = json!("incomplete");
         response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+    } else if is_context_exceeded(stop_reason) {
+        response["status"] = json!("failed");
+        response["error"] = json!({"type": "invalid_request_error", "code": "context_length_exceeded", "message": "Conversation context exceeded the model's context window. Compact the conversation or start a new one, then retry."});
     }
 
+    if is_compaction
+        && (is_truncated(stop_reason)
+            || response["output"][0]["encrypted_content"].as_str() == Some(""))
+    {
+        response["status"] = json!("failed");
+        response
+            .as_object_mut()
+            .unwrap()
+            .remove("incomplete_details");
+        response["error"] = json!({"type":"server_error", "code":"compaction_failed", "message":"Context compaction did not produce a complete, usable summary."});
+        response["output"] = json!([]);
+    }
     response
 }

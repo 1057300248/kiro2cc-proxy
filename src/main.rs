@@ -198,6 +198,32 @@ async fn main() {
     let mut anthropic_app_state = anthropic::middleware::AppState::new()
         .with_rpm_tracker(rpm_tracker.clone())
         .with_fingerprint_tracker(fingerprint_tracker.clone());
+    anthropic_app_state.response_store_client_auth =
+        model::client_auth_scope::ClientAuthScope::from_config(&config)
+            .unwrap_or_else(|message| {
+                tracing::error!("{}", message);
+                std::process::exit(1);
+            })
+            .map(Arc::new);
+    if anthropic_app_state.response_store_client_auth.is_some() {
+        tracing::info!("已启用 Kiro 侧客户凭据续接隔离；无需 New API 源码补丁");
+    }
+    if let Some(header_name) = config.response_store_tenant_header.as_deref() {
+        if header_name.trim().is_empty()
+            || http::header::HeaderName::from_bytes(header_name.trim().as_bytes()).is_err()
+        {
+            tracing::error!(
+                "Invalid responseStoreTenantHeader; refusing to disable isolation silently"
+            );
+            std::process::exit(1);
+        }
+        anthropic_app_state =
+            anthropic_app_state.with_response_store_tenant_header(header_name.to_string());
+        tracing::info!(
+            header = %header_name,
+            "已启用 Responses 反代租户隔离"
+        );
+    }
     if let Some(ref manager) = api_key_manager {
         anthropic_app_state = anthropic_app_state.with_api_key_manager(manager.clone());
     }

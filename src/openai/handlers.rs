@@ -35,9 +35,13 @@ use super::sse::{SseItem, SseParser};
 trait StreamConverter {
     fn on_event(&mut self, name: &str, data: &Value) -> Vec<String>;
     fn finish(&mut self) -> Vec<String>;
+    fn is_finished(&self) -> bool;
 }
 
 impl StreamConverter for ChatStreamConverter {
+    fn is_finished(&self) -> bool {
+        ChatStreamConverter::is_finished(self)
+    }
     fn on_event(&mut self, name: &str, data: &Value) -> Vec<String> {
         ChatStreamConverter::on_event(self, name, data)
     }
@@ -48,6 +52,9 @@ impl StreamConverter for ChatStreamConverter {
 }
 
 impl StreamConverter for ResponsesStreamConverter {
+    fn is_finished(&self) -> bool {
+        ResponsesStreamConverter::is_finished(self)
+    }
     fn on_event(&mut self, name: &str, data: &Value) -> Vec<String> {
         ResponsesStreamConverter::on_event(self, name, data)
     }
@@ -90,6 +97,8 @@ pub(crate) async fn post_chat_completions(
 
     let client_model = converted.client_model;
     let include_usage = converted.include_usage;
+    let tool_name_map = converted.tool_name_map;
+    let stream_tool_name_map = tool_name_map.clone();
     let converter_model = client_model.clone();
     forward_and_wrap(
         state,
@@ -99,8 +108,16 @@ pub(crate) async fn post_chat_completions(
         converted.anthropic_body,
         converted.stream,
         client_model,
-        move || Box::new(ChatStreamConverter::new(&converter_model, include_usage)),
-        chat_response::convert_non_stream,
+        move || {
+            Box::new(ChatStreamConverter::with_tool_name_map(
+                &converter_model,
+                include_usage,
+                stream_tool_name_map,
+            ))
+        },
+        move |anthropic, model| {
+            chat_response::convert_non_stream_with_tool_name_map(anthropic, model, &tool_name_map)
+        },
     )
     .await
 }
@@ -118,10 +135,56 @@ pub(crate) async fn post_responses(
         Err(response) => return *response,
     };
 
-    let converted = match responses_request::convert(&incoming) {
+    let Some(owner_api_key_id) = identity.as_ref().map(|context| context.0.id) else {
+        return error::error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_request_error",
+            "Invalid API key.",
+            Some("invalid_api_key"),
+        );
+    };
+    let owner_scope = identity
+        .as_ref()
+        .and_then(|context| context.0.response_store_scope.as_deref());
+    if state.response_store_client_auth.is_some() {
+        if let Err(message) =
+            crate::model::client_auth_scope::check_request_scope(&incoming, owner_scope)
+        {
+            return error::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+                Some("client_identity_required"),
+            );
+        }
+    } else if state.response_store_tenant_header.is_some() && owner_scope.is_none() {
+        return error::error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Configured Responses tenant header is missing or invalid.",
+            None,
+        );
+    }
+    let prepared = match state.response_store.prepare_request_with_scope(
+        owner_api_key_id,
+        owner_scope,
+        &incoming,
+    ) {
+        Ok(prepared) => prepared,
+        Err(msg) => {
+            return error::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                msg,
+                None,
+            );
+        }
+    };
+
+    let converted = match responses_request::convert(&prepared.body) {
         Ok(c) => c,
         Err(msg) => {
-            // 有状态请求（previous_response_id）在这里就被拒，不产生任何上游请求
+            // 请求转换失败时不触达上游。
             return error::error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -134,6 +197,8 @@ pub(crate) async fn post_responses(
     tracing::info!(
         model = %converted.client_model,
         stream = converted.stream,
+        continued = prepared.continued,
+        store = prepared.store_response,
         "Received POST /v1/responses request"
     );
 
@@ -142,7 +207,17 @@ pub(crate) async fn post_responses(
     // custom 工具名要同时供流式与非流式转换使用，各持一份（集合很小，克隆成本可忽略）
     let custom_tools = converted.custom_tools;
     let stream_custom_tools = custom_tools.clone();
+    let tool_name_map = converted.tool_name_map;
+    let stream_tool_name_map = tool_name_map.clone();
     let is_compaction = converted.is_compaction;
+    let persistence = state.response_store.persistence_with_scope(
+        owner_api_key_id,
+        owner_scope,
+        prepared.history,
+        prepared.store_response,
+    );
+    let stream_persistence = persistence.clone();
+    let nonstream_persistence = persistence;
     forward_and_wrap(
         state,
         identity,
@@ -152,24 +227,45 @@ pub(crate) async fn post_responses(
         converted.stream,
         client_model,
         move || {
-            if is_compaction {
-                Box::new(ResponsesStreamConverter::new_compaction(
+            let converter = if is_compaction {
+                ResponsesStreamConverter::new_compaction_with_tool_name_map(
                     &converter_model,
                     stream_custom_tools,
-                ))
+                    stream_tool_name_map,
+                )
             } else {
-                Box::new(ResponsesStreamConverter::new(
+                ResponsesStreamConverter::new_with_tool_name_map(
                     &converter_model,
                     stream_custom_tools,
-                ))
-            }
+                    stream_tool_name_map,
+                )
+            };
+            let converter = match stream_persistence {
+                Some(persistence) => converter.with_persistence(persistence),
+                None => converter,
+            };
+            Box::new(converter)
         },
         move |anthropic, model| {
-            if is_compaction {
-                responses_response::convert_non_stream_compaction(anthropic, model, &custom_tools)
+            let response = if is_compaction {
+                responses_response::convert_non_stream_compaction_with_tool_name_map(
+                    anthropic,
+                    model,
+                    &custom_tools,
+                    &tool_name_map,
+                )
             } else {
-                responses_response::convert_non_stream(anthropic, model, &custom_tools)
+                responses_response::convert_non_stream_with_tool_name_map(
+                    anthropic,
+                    model,
+                    &custom_tools,
+                    &tool_name_map,
+                )
+            };
+            if let Some(persistence) = &nonstream_persistence {
+                persistence.persist(&response);
             }
+            response
         },
     )
     .await
@@ -301,6 +397,9 @@ fn stream_openai_response(body: Body, converter: Box<dyn StreamConverter + Send>
                             for frame in converter.on_event(&name, &data) {
                                 buf.push_str(&frame);
                             }
+                            if converter.is_finished() {
+                                break;
+                            }
                         }
                         // SseItem::Done：Anthropic 侧不发，收到也无需转发
                     }
@@ -308,9 +407,14 @@ fn stream_openai_response(body: Body, converter: Box<dyn StreamConverter + Send>
                         // 本次 chunk 只含半帧或 ping，继续等下一块
                         continue;
                     }
+                    let next = if converter.is_finished() {
+                        None
+                    } else {
+                        Some((ds, parser, converter))
+                    };
                     return Some((
                         Ok::<Bytes, std::convert::Infallible>(Bytes::from(buf)),
-                        Some((ds, parser, converter)),
+                        next,
                     ));
                 }
                 Some(Err(e)) => {
@@ -359,4 +463,100 @@ fn stream_openai_response(body: Body, converter: Box<dyn StreamConverter + Send>
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(out))
         .expect("构造 SSE 响应不会失败")
+}
+
+#[cfg(test)]
+mod transport_review_20261001 {
+    use super::*;
+    use crate::model::response_store::ResponseStore;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    fn event(name: &str, data: Value) -> String {
+        format!("event: {name}\ndata: {data}\n\n")
+    }
+    async fn consume(
+        chunks: Vec<Result<Bytes, std::io::Error>>,
+        converter: ResponsesStreamConverter,
+    ) -> String {
+        let response = stream_openai_response(
+            Body::from_stream(futures::stream::iter(chunks)),
+            Box::new(converter),
+        );
+        String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn malformed_frame_cannot_be_hidden_by_later_success() {
+        let data = event("message_start", json!({}))
+            + "event: content_block_delta\ndata: {broken}\n\n"
+            + &event("message_stop", json!({}));
+        let text = consume(
+            vec![Ok(Bytes::from(data))],
+            ResponsesStreamConverter::new("m", HashSet::new()),
+        )
+        .await;
+        assert!(text.contains("response.failed"));
+        assert!(!text.contains("response.completed"));
+    }
+    #[tokio::test]
+    async fn partial_eof_and_transport_error_never_persist() {
+        for transport_error in [false, true] {
+            let store = Arc::new(ResponseStore::default());
+            let converter = ResponsesStreamConverter::new("m", HashSet::new())
+                .with_persistence(store.persistence(1, Vec::new(), true).unwrap());
+            let data = event(
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"tool_use","id":"c","name":"f"}}),
+            ) + &event(
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"x\":"}}),
+            );
+            let mut chunks = vec![Ok(Bytes::from(data))];
+            if transport_error {
+                chunks.push(Err(std::io::Error::other("fixture interrupted")));
+            }
+            let text = consume(chunks, converter).await;
+            assert!(text.contains("response.failed"));
+            assert!(!text.contains("response.completed"));
+            assert!(!text.contains("response.function_call_arguments.done"));
+            let failed: Value = text
+                .lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .find(|v| v["type"] == "response.failed")
+                .unwrap();
+            assert!(
+                store
+                    .prepare_request(
+                        1,
+                        &json!({"previous_response_id":failed["response"]["id"],"input":"next"})
+                    )
+                    .is_err()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn split_success_finishes_once_and_drops_late_content() {
+        let data = event(
+            "content_block_start",
+            json!({"index":0,"content_block":{"type":"text","text":"answer"}}),
+        ) + &event("message_stop", json!({}))
+            + &event(
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"text_delta","text":"MUST_NOT_APPEAR"}}),
+            );
+        let chunks = data
+            .as_bytes()
+            .chunks(7)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        let text = consume(chunks, ResponsesStreamConverter::new("m", HashSet::new())).await;
+        assert_eq!(text.matches("event: response.completed\n").count(), 1);
+        assert!(!text.contains("MUST_NOT_APPEAR"));
+    }
 }

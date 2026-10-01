@@ -129,9 +129,25 @@
 - **WHEN** 请求 `input` 含 `{"type":"custom_tool_call","call_id":"c2","name":"apply_patch","input":"*** Begin Patch"}`
 - **THEN** Anthropic 请求中对应 `tool_use` 的 `input` 为 `{"input":"*** Begin Patch"}`
 
-#### 场景：拒绝有状态请求
-- **WHEN** 请求含非空 `previous_response_id`
-- **THEN** 返回 `400`，body 为 OpenAI 错误结构且 `error.message` 明确指出本端点不支持 `previous_response_id`，且**不**向 Kiro 上游发起任何请求
+#### 场景：previous_response_id 续接
+- **WHEN** 请求含非空 `previous_response_id`，且该响应由当前 API Key 在 TTL 内以 `store=true` 产生
+- **THEN** 代理在触达 Kiro 前恢复此前输入与输出历史，再拼接本轮 `input`；不同 API Key 不得读取彼此的响应历史
+
+#### 场景：共享上游 Key 时按可信反代租户隔离
+- **WHEN** 配置 `responseStoreTenantHeader`，且请求由反代在该请求头中传入租户身份
+- **THEN** 代理只保留该身份的 SHA-256 哈希，并将其与 API Key 一起作为 continuation store 的隔离范围；同一 API Key 下不同租户不得读取彼此的响应历史
+
+#### 场景：租户请求头缺失时拒绝有状态 Responses 请求
+- **WHEN** 已配置 `responseStoreTenantHeader`，但 `POST /v1/responses` 未携带有效的该请求头
+- **THEN** 代理返回 `400`，不读取或写入共享的 continuation 命名空间
+
+#### 场景：store=false
+- **WHEN** Responses 请求显式包含 `store:false`
+- **THEN** 本轮响应不写入 continuation store，后续以其 response id 续接时返回明确的 `400`
+
+#### 场景：item_reference
+- **WHEN** 本轮同时提供有效 `previous_response_id` 与 `{"type":"item_reference","id":"..."}`
+- **THEN** 代理从该 previous response 的历史中解析对应 output item；找不到、已过期或跨 API Key 引用时返回 `400`
 
 #### 场景：忽略 encrypted_content include
 - **WHEN** 请求 `include` 数组含 `"reasoning.encrypted_content"`
@@ -141,9 +157,13 @@
 - **WHEN** 请求含 `max_output_tokens:8000`
 - **THEN** Anthropic 请求的 `max_tokens` 为 `8000`
 
-#### 场景：截断状态映射
-- **WHEN** 上游 `stop_reason` 为 `max_tokens` 或 `model_context_window_exceeded`
-- **THEN** 非流式响应的 `status` 为 `incomplete` 且 `incomplete_details.reason` 为 `max_output_tokens`；流式以 `response.incomplete` 事件收尾而非 `response.completed`
+#### 场景：输出截断状态映射
+- **WHEN** 上游 `stop_reason` 为 `max_tokens`
+- **THEN** 非流式响应的 `status` 为 `incomplete` 且 `incomplete_details.reason` 为 `max_output_tokens`；流式以 `response.incomplete` 收尾
+
+#### 场景：上下文窗口耗尽
+- **WHEN** 上游 `stop_reason` 为 `model_context_window_exceeded`
+- **THEN** 非流式响应返回 `status = failed` 及 `error.code = context_length_exceeded`；流式以 `response.failed` 收尾，`response.error.code = context_length_exceeded`，不得伪装为 `max_output_tokens`
 
 ---
 
@@ -196,3 +216,13 @@
 #### 场景：现有测试全绿
 - **WHEN** 执行 `cargo test`
 - **THEN** 本变更前已存在的全部测试用例均通过，无一失败或被修改断言
+
+
+### Requirement: Kiro-only client credential continuation scope
+
+- New API requires no code patch; only its existing explicit Header Override is used.
+- Kiro enables responseStoreClientAuthorizationHeader and requires an environment-only RESPONSE_STORE_HMAC_KEY (32 bytes / 64 hex). Legacy trusted-tenant mode is mutually exclusive.
+- The configured internal header is consumed at the authentication boundary, canonicalized only for the documented standard New API Authorization grammar, and HMAC-scoped. Raw credentials are not logged, forwarded to model upstreams, or persisted in continuation records.
+- Missing identity allows only explicit store=false with no previous_response_id or item_reference. Every continuation requires identity even if store=false. Invalid values never degrade to missing/shared identity.
+- Duplicate/coalesced values, unsupported authentication sentinels, routing suffixes and copied gateway keys are rejected. No user/body metadata/IP/tenant-header fallback is permitted.
+- The gateway MUST overwrite this internal header from the credential it actually authenticated and MUST NOT allow wildcard/regex/dynamic-header passthrough fallbacks. Kiro must only be accessible through the trusted gateway. This is a deployment precondition, not an authentication property created by hashing.

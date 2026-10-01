@@ -2,11 +2,15 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::openai::stream_integrity::StreamIntegrity;
 use serde_json::{Value, json};
 
 use super::nonstream::{
-    compaction_item, convert_usage, custom_input_from_json_text, is_truncated, new_id,
+    compaction_item, convert_usage, custom_input_from_json_text, is_context_exceeded, is_truncated,
+    new_id,
 };
+
+use crate::model::response_store::ResponsePersistence;
 
 use super::super::chat_response::{
     INPUT_JSON_DELTA, SIGNATURE_DELTA, TEXT_DELTA, THINKING_DELTA, unix_now,
@@ -20,7 +24,7 @@ use super::super::chat_response::{
 // 1. 每个事件的 `sequence_number` 从 0 起严格递增（跨所有事件类型共用一个计数器）
 // 2. 每个 output item 必须成对出现 `response.output_item.added` / `.done`
 // 3. 文本与推理的 `output_index` 不同（它们是两个独立的 output item）
-// 4. 流必须以 `response.completed` 或 `response.incomplete` 收尾，否则客户端会一直等
+// 4. 流必须以 `response.completed` / `response.incomplete` / `response.failed` 收尾
 
 /// 上游一个 content block 只映射一个 part，故 part 序号恒为 0
 const SINGLE_PART_INDEX: i64 = 0;
@@ -61,15 +65,22 @@ pub(crate) struct ResponsesStreamConverter {
     sequence: i64,
     created_sent: bool,
     finished: bool,
+    integrity: StreamIntegrity,
     truncated: bool,
+    context_exceeded: bool,
+    aborting: bool,
     usage: Option<Value>,
     next_output_index: i64,
     /// Anthropic block index → 打开中的 output item
     open: HashMap<i64, OpenItem>,
     /// 已收尾的 output item，用于 `response.completed` 的快照
     completed_items: Vec<Value>,
-    /// 请求侧声明为 `custom` 的工具名
+    /// 请求侧声明为 `custom` 的 Kiro 工具名
     custom_tools: HashSet<String>,
+    /// Kiro 短工具名 -> 客户端原始工具名
+    tool_name_map: HashMap<String, String>,
+    /// 成功/截断终态写入 continuation store；失败终态不保存
+    persistence: Option<ResponsePersistence>,
     /// 是否为 Codex remote compaction v2 请求
     ///
     /// 为 true 时，`finish()` 将把所有文本内容拼合后包装为 `type: "compaction"` output item，
@@ -78,7 +89,16 @@ pub(crate) struct ResponsesStreamConverter {
 }
 
 impl ResponsesStreamConverter {
+    #[allow(dead_code)] // convenience constructor retained for unit tests
     pub(crate) fn new(client_model: &str, custom_tools: HashSet<String>) -> Self {
+        Self::new_with_tool_name_map(client_model, custom_tools, HashMap::new())
+    }
+
+    pub(crate) fn new_with_tool_name_map(
+        client_model: &str,
+        custom_tools: HashSet<String>,
+        tool_name_map: HashMap<String, String>,
+    ) -> Self {
         Self {
             id: new_id("resp"),
             created_at: unix_now(),
@@ -86,35 +106,113 @@ impl ResponsesStreamConverter {
             sequence: 0,
             created_sent: false,
             finished: false,
+            integrity: StreamIntegrity::default(),
             truncated: false,
+            context_exceeded: false,
+            aborting: false,
             usage: None,
             next_output_index: 0,
             open: HashMap::new(),
             completed_items: Vec::new(),
             custom_tools,
+            tool_name_map,
+            persistence: None,
             is_compaction: false,
         }
+    }
+
+    /// Attach server-side persistence for previous_response_id continuation.
+    pub(crate) fn with_persistence(mut self, persistence: ResponsePersistence) -> Self {
+        self.persistence = Some(persistence);
+        self
     }
 
     /// 创建压缩模式的流式转换器
     ///
     /// 在 `finish()` 时将文本响应包装为 `type: "compaction"` output item 而非普通 message item。
+    #[allow(dead_code)] // convenience constructor retained for unit tests
     pub(crate) fn new_compaction(client_model: &str, custom_tools: HashSet<String>) -> Self {
-        let mut conv = Self::new(client_model, custom_tools);
+        Self::new_compaction_with_tool_name_map(client_model, custom_tools, HashMap::new())
+    }
+
+    pub(crate) fn new_compaction_with_tool_name_map(
+        client_model: &str,
+        custom_tools: HashSet<String>,
+        tool_name_map: HashMap<String, String>,
+    ) -> Self {
+        let mut conv = Self::new_with_tool_name_map(client_model, custom_tools, tool_name_map);
         conv.is_compaction = true;
         conv
     }
 
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished
+    }
+
     /// 处理一个上游事件，返回待下发的 SSE 帧
     pub(crate) fn on_event(&mut self, name: &str, data: &Value) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
+        if let Err(message) = self.integrity.observe(name, data) {
+            return self.on_error(&json!({"error": {"type": "api_error", "message": message}}));
+        }
         // 压缩模式：content_block_* 事件内部仍需执行（以累积文本），但不向客户端转发
         let is_compaction = self.is_compaction;
-        let pass = |f: Vec<String>| if is_compaction { Vec::new() } else { f };
         match name {
-            "message_start" => self.ensure_created(),
-            "content_block_start" => pass(self.on_block_start(data)),
-            "content_block_delta" => pass(self.on_block_delta(data)),
-            "content_block_stop" => pass(self.close_item(block_index(data))),
+            "message_start" => {
+                let frames = self.ensure_created();
+                if self.usage.is_none() {
+                    let baseline = data.get("message").and_then(|message| message.get("usage"));
+                    self.usage = Some(convert_usage(baseline));
+                }
+                frames
+            }
+            "content_block_start" => {
+                let initial = if is_compaction {
+                    self.ensure_created()
+                } else {
+                    Vec::new()
+                };
+                let sequence = self.sequence;
+                let events = self.on_block_start(data);
+                if is_compaction {
+                    self.sequence = sequence;
+                    initial
+                } else {
+                    events
+                }
+            }
+            "content_block_delta" => {
+                let initial = if is_compaction {
+                    self.ensure_created()
+                } else {
+                    Vec::new()
+                };
+                let sequence = self.sequence;
+                let events = self.on_block_delta(data);
+                if is_compaction {
+                    self.sequence = sequence;
+                    initial
+                } else {
+                    events
+                }
+            }
+            "content_block_stop" => {
+                let initial = if is_compaction {
+                    self.ensure_created()
+                } else {
+                    Vec::new()
+                };
+                let sequence = self.sequence;
+                let events = self.close_item(block_index(data));
+                if is_compaction {
+                    self.sequence = sequence;
+                    initial
+                } else {
+                    events
+                }
+            }
             "message_delta" => {
                 if let Some(reason) = data
                     .get("delta")
@@ -122,9 +220,10 @@ impl ResponsesStreamConverter {
                     .and_then(Value::as_str)
                 {
                     self.truncated = is_truncated(Some(reason));
+                    self.context_exceeded = is_context_exceeded(Some(reason));
                 }
                 if let Some(usage) = data.get("usage") {
-                    self.usage = Some(convert_usage(Some(usage)));
+                    self.update_usage(usage);
                 }
                 Vec::new()
             }
@@ -137,16 +236,61 @@ impl ResponsesStreamConverter {
         }
     }
 
+    /// Merge a possibly partial `message_delta.usage` into the message-start baseline.
+    /// Some upstream paths report only output tokens in the delta.
+    fn update_usage(&mut self, usage: &Value) {
+        let has_input = [
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ]
+        .iter()
+        .any(|key| usage.get(*key).and_then(Value::as_i64).is_some());
+        let incoming = convert_usage(Some(usage));
+        if has_input || self.usage.is_none() {
+            self.usage = Some(incoming);
+            return;
+        }
+
+        if let Some(current) = self.usage.as_mut() {
+            current["output_tokens"] = incoming["output_tokens"].clone();
+            let input = current["input_tokens"].as_i64().unwrap_or_default();
+            let output = current["output_tokens"].as_i64().unwrap_or_default();
+            current["total_tokens"] = json!(input + output);
+        }
+    }
+
     /// 上游流结束时收尾：闭合所有未完成的 item，再下发终止事件
     pub(crate) fn finish(&mut self) -> Vec<String> {
         if self.finished {
             return Vec::new();
         }
+        if !self.integrity.stopped {
+            return self.on_error(&json!({"error": {"type": "api_error", "message": "Upstream stream ended before message_stop."}}));
+        }
+        if self.is_compaction && self.truncated {
+            return self.on_error(&json!({"error": {"type": "api_error", "message": "Context compaction was truncated; the previous history was not replaced."}}));
+        }
         // 即使上游一个内容块都没给，也要让客户端看到合法的事件序列
         let mut frames = self.ensure_created();
-        frames.extend(self.close_all_open());
+        let sequence = self.sequence;
+        let closing = self.close_all_open();
+        if self.is_compaction {
+            self.sequence = sequence;
+        } else {
+            frames.extend(closing);
+        }
 
         self.finished = true;
+
+        if self.context_exceeded {
+            frames.push(self.failed_event(
+                "invalid_request_error",
+                Some("context_length_exceeded"),
+                "Conversation context exceeded the model's context window. Compact the conversation or start a new one, then retry.",
+            ));
+            return frames;
+        }
 
         if self.is_compaction {
             return self.finish_compaction(frames);
@@ -163,6 +307,7 @@ impl ResponsesStreamConverter {
             "response.completed"
         };
         let snapshot = self.snapshot(status);
+        self.persist_snapshot(&snapshot);
         frames.push(self.event(event_name, json!({"response": snapshot})));
         frames
     }
@@ -197,11 +342,15 @@ impl ResponsesStreamConverter {
 
         let summary = summary.trim();
         if summary.is_empty() {
-            tracing::warn!(
-                "compaction 模式下模型未返回文本内容（可能为纯 reasoning 或 tool call），\
-                 将产出空摘要 item，Codex 可能无法正确恢复上下文"
-            );
-        } else {
+            self.completed_items.clear();
+            frames.push(self.failed_event(
+                "server_error",
+                None,
+                "Context compaction returned no usable summary.",
+            ));
+            return frames;
+        }
+        {
             tracing::info!(
                 "流式模式生成 compaction output item（摘要 {} 字节）",
                 summary.len()
@@ -225,6 +374,7 @@ impl ResponsesStreamConverter {
         ));
 
         let snapshot = self.snapshot("completed");
+        self.persist_snapshot(&snapshot);
         frames.push(self.event("response.completed", json!({"response": snapshot})));
         frames
     }
@@ -252,20 +402,48 @@ impl ResponsesStreamConverter {
             return Vec::new();
         }
         let (message, error_type, code) = super::super::error::extract_stream_error(data);
-        tracing::warn!(error_type = %error_type, "上游流式响应报错，已下发 error 事件并终止");
-
         let mut frames = self.ensure_created();
-        frames.extend(self.close_all_open());
+        self.aborting = true;
+        let sequence = self.sequence;
+        let closing = self.close_all_open();
+        if self.is_compaction {
+            self.sequence = sequence;
+            self.completed_items.clear();
+        } else {
+            // Re-number after suppressing partial tool input/arguments completion.
+            self.sequence = sequence;
+            for frame in closing {
+                let Some((event, payload)) = frame.split_once("\ndata: ") else {
+                    continue;
+                };
+                let name = event.trim_start_matches("event: ");
+                if matches!(
+                    name,
+                    "response.function_call_arguments.done"
+                        | "response.custom_tool_call_input.done"
+                        | "response.custom_tool_call_input.delta"
+                ) {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(payload.trim()) {
+                    frames.push(self.event(name, value));
+                }
+            }
+        }
         self.finished = true;
-        frames.push(self.event(
-            "error",
-            json!({
-                "code": code.map(Value::from).unwrap_or(Value::Null),
-                "message": message,
-                "param": Value::Null,
-            }),
-        ));
+        frames.push(self.failed_event(error_type, code, &message));
         frames
+    }
+
+    /// Build the terminal response.failed event understood by Codex Responses clients.
+    fn failed_event(&mut self, error_type: &str, code: Option<&str>, message: &str) -> String {
+        let mut response = self.snapshot("failed");
+        response["error"] = json!({
+            "type": error_type,
+            "code": code.map(Value::from).unwrap_or(Value::Null),
+            "message": message,
+        });
+        self.event("response.failed", json!({"response": response}))
     }
 
     /// 首两个事件（`response.created` + `response.in_progress`）只发一次
@@ -543,6 +721,7 @@ impl ResponsesStreamConverter {
     fn open_tool_call(&mut self, index: i64, call_id: String, name: String) -> Vec<String> {
         let mut frames = self.ensure_created();
         let custom = self.custom_tools.contains(&name);
+        let client_name = self.tool_name_map.get(&name).cloned().unwrap_or(name);
         let item_id = new_id(if custom { "ctc" } else { "fc" });
         let output_index = self.take_output_index();
         self.open.insert(
@@ -552,7 +731,7 @@ impl ResponsesStreamConverter {
                 item_id: item_id.clone(),
                 kind: OpenKind::ToolCall {
                     call_id: call_id.clone(),
-                    name: name.clone(),
+                    name: client_name.clone(),
                     custom,
                 },
                 buffer: String::new(),
@@ -564,7 +743,7 @@ impl ResponsesStreamConverter {
                 "type": "custom_tool_call",
                 "id": item_id,
                 "call_id": call_id,
-                "name": name,
+                "name": client_name,
                 "input": "",
                 "status": "in_progress",
             })
@@ -573,7 +752,7 @@ impl ResponsesStreamConverter {
                 "type": "function_call",
                 "id": item_id,
                 "call_id": call_id,
-                "name": name,
+                "name": client_name,
                 "arguments": "",
                 "status": "in_progress",
             })
@@ -602,7 +781,7 @@ impl ResponsesStreamConverter {
                 let done_item = json!({
                     "type": "message",
                     "id": item_id,
-                    "status": "completed",
+                    "status": if self.aborting { "incomplete" } else { "completed" },
                     "role": "assistant",
                     "content": [{"type": "output_text", "text": buffer, "annotations": []}],
                 });
@@ -676,7 +855,7 @@ impl ResponsesStreamConverter {
                     "call_id": call_id,
                     "name": name,
                     "input": input,
-                    "status": "completed",
+                    "status": if self.aborting { "incomplete" } else { "completed" },
                 });
                 self.completed_items.push(done_item.clone());
                 let mut frames = Vec::new();
@@ -722,7 +901,7 @@ impl ResponsesStreamConverter {
                     "call_id": call_id,
                     "name": name,
                     "arguments": arguments,
-                    "status": "completed",
+                    "status": if self.aborting { "incomplete" } else { "completed" },
                 });
                 self.completed_items.push(done_item.clone());
                 vec![
@@ -747,6 +926,12 @@ impl ResponsesStreamConverter {
         let i = self.next_output_index;
         self.next_output_index += 1;
         i
+    }
+
+    fn persist_snapshot(&self, response: &Value) {
+        if let Some(persistence) = &self.persistence {
+            persistence.persist(response);
+        }
     }
 
     /// `response` 对象快照；`in_progress` 阶段 usage 尚未知，按协议给 `null`
@@ -783,4 +968,78 @@ impl ResponsesStreamConverter {
 /// 取事件里的上游 block index（缺失时按 0 处理，与 chat 侧一致）
 fn block_index(data: &Value) -> i64 {
     data.get("index").and_then(Value::as_i64).unwrap_or(0)
+}
+#[cfg(test)]
+mod review_20261001 {
+    use super::*;
+    use crate::model::response_store::ResponseStore;
+    use std::sync::Arc;
+    fn parsed(frame: &str) -> Value {
+        serde_json::from_str(frame.split_once("\ndata: ").unwrap().1.trim()).unwrap()
+    }
+    #[test]
+    fn premature_eof_never_persists_and_terminal_is_idempotent() {
+        let store = Arc::new(ResponseStore::default());
+        let mut c = ResponsesStreamConverter::new("m", HashSet::new())
+            .with_persistence(store.persistence(1, Vec::new(), true).unwrap());
+        c.on_event(
+            "content_block_start",
+            &json!({"index":0,"content_block":{"type":"text","text":"half"}}),
+        );
+        let frames = c.finish();
+        let last = parsed(frames.last().unwrap());
+        assert_eq!(last["type"], "response.failed");
+        assert!(
+            store
+                .prepare_request(
+                    1,
+                    &json!({"previous_response_id":last["response"]["id"],"input":"x"})
+                )
+                .is_err()
+        );
+        assert!(
+            c.on_event(
+                "content_block_delta",
+                &json!({"delta":{"type":"text_delta","text":"late"}})
+            )
+            .is_empty()
+        );
+        assert!(c.on_event("message_stop", &json!({})).is_empty());
+    }
+    #[test]
+    fn compaction_suppresses_hidden_items_and_keeps_contiguous_sequence() {
+        let mut c = ResponsesStreamConverter::new_compaction("m", HashSet::new());
+        let mut all = Vec::new();
+        for (name, data) in [
+            (
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"text","text":"summary"}}),
+            ),
+            ("message_stop", json!({})),
+        ] {
+            all.extend(c.on_event(name, &data));
+        }
+        for (i, frame) in all.iter().enumerate() {
+            assert_eq!(parsed(frame)["sequence_number"], json!(i));
+        }
+        assert_eq!(
+            parsed(all.last().unwrap())["response"]["output"][0]["type"],
+            "compaction"
+        );
+        assert!(!all.concat().contains("response.output_text.done"));
+    }
+    #[test]
+    fn truncated_compaction_cannot_report_completed() {
+        let mut c = ResponsesStreamConverter::new_compaction("m", HashSet::new());
+        c.on_event(
+            "content_block_start",
+            &json!({"index":0,"content_block":{"type":"text","text":"partial"}}),
+        );
+        c.on_event(
+            "message_delta",
+            &json!({"delta":{"stop_reason":"max_tokens"}}),
+        );
+        let frames = c.on_event("message_stop", &json!({}));
+        assert_eq!(parsed(frames.last().unwrap())["type"], "response.failed");
+    }
 }

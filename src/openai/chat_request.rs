@@ -13,7 +13,10 @@
 //! `temperature` / `top_p` / `frequency_penalty` / `presence_penalty` / `n` / `stop` /
 //! `logprobs` / `seed` 同样无处安放（Kiro 上游不接受采样参数），一并忽略。
 
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::model_map::map_model;
 
@@ -39,6 +42,62 @@ pub(crate) struct ConvertedChatRequest {
     pub(crate) include_usage: bool,
     /// 转换后的 Anthropic 请求体
     pub(crate) anthropic_body: Value,
+    /// Kiro 短工具名 -> 客户端原始工具名
+    pub(crate) tool_name_map: HashMap<String, String>,
+}
+
+const MAX_KIRO_TOOL_NAME_CHARS: usize = 64;
+
+/// Kiro ToolSpecification.name 最长 64 字符，且只接受 ASCII 字母数字、下划线和连字符。
+/// 不满足约束时生成稳定的安全别名；响应侧再用映射恢复客户端原名。
+pub(super) fn kiro_tool_name(name: &str) -> String {
+    const PREFIX: &str = "kiro2cc_";
+    let safe = !name.is_empty()
+        && name.len() <= MAX_KIRO_TOOL_NAME_CHARS
+        && !name.to_ascii_lowercase().starts_with(PREFIX)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if safe {
+        return name.to_string();
+    }
+    let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
+    format!(
+        "{PREFIX}{}",
+        &digest[..MAX_KIRO_TOOL_NAME_CHARS - PREFIX.len()]
+    )
+}
+
+fn register_tool_alias(
+    original: &str,
+    original_to_short: &mut HashMap<String, String>,
+    short_to_original: &mut HashMap<String, String>,
+) -> String {
+    let short = kiro_tool_name(original);
+    if short != original {
+        original_to_short
+            .entry(original.to_string())
+            .or_insert_with(|| short.clone());
+        short_to_original
+            .entry(short.clone())
+            .or_insert_with(|| original.to_string());
+    }
+    short
+}
+
+fn normalize_tool_names(tools: &mut [Value]) -> (HashMap<String, String>, HashMap<String, String>) {
+    let mut original_to_short = HashMap::new();
+    let mut short_to_original = HashMap::new();
+    for tool in tools {
+        let Some(original) = tool.get("name").and_then(Value::as_str).map(str::to_string) else {
+            continue;
+        };
+        let short = register_tool_alias(&original, &mut original_to_short, &mut short_to_original);
+        if short != original {
+            tool["name"] = json!(short);
+        }
+    }
+    (original_to_short, short_to_original)
 }
 
 /// 把 OpenAI Chat Completions 请求体转换为 Anthropic Messages 请求体
@@ -75,7 +134,26 @@ pub(crate) fn convert(body: &Value) -> Result<ConvertedChatRequest, String> {
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_MAX_TOKENS);
 
-    let (system, anthropic_messages) = convert_messages(messages);
+    let mut converted_tools = convert_tools(body.get("tools")).unwrap_or_default();
+    let (mut original_to_short, mut tool_name_map) = normalize_tool_names(&mut converted_tools);
+    for message in messages {
+        let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
+            continue;
+        };
+        for call in calls {
+            let Some(name) = call
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            register_tool_alias(name, &mut original_to_short, &mut tool_name_map);
+        }
+    }
+
+    let (system, anthropic_messages) = convert_messages(messages, &original_to_short);
     // 入参非空不代表转换后非空：整段全是 system、或每条 content 都为空时会被过滤干净。
     // 空 messages 会被下游直接拒绝，在这里就给出可读的 400，与 responses 侧保持一致。
     if anthropic_messages.is_empty() {
@@ -93,8 +171,8 @@ pub(crate) fn convert(body: &Value) -> Result<ConvertedChatRequest, String> {
         anthropic["system"] = Value::Array(system);
     }
 
-    if let Some(tools) = convert_tools(body.get("tools")) {
-        anthropic["tools"] = Value::Array(tools);
+    if !converted_tools.is_empty() {
+        anthropic["tools"] = Value::Array(converted_tools);
     }
 
     super::pass_through_user(body, &mut anthropic);
@@ -110,11 +188,15 @@ pub(crate) fn convert(body: &Value) -> Result<ConvertedChatRequest, String> {
         stream,
         include_usage,
         anthropic_body: anthropic,
+        tool_name_map,
     })
 }
 
 /// 把 OpenAI messages 拆成 (system 块数组, Anthropic messages 数组)
-fn convert_messages(messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
+fn convert_messages(
+    messages: &[Value],
+    original_to_short: &HashMap<String, String>,
+) -> (Vec<Value>, Vec<Value>) {
     let mut system = Vec::new();
     let mut acc = MessageAccumulator::default();
 
@@ -135,7 +217,7 @@ fn convert_messages(messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
                 }
             }
             "assistant" => {
-                let blocks = convert_assistant_message(msg);
+                let blocks = convert_assistant_message(msg, original_to_short);
                 if !blocks.is_empty() {
                     acc.push("assistant", blocks);
                 }
@@ -292,7 +374,10 @@ fn parse_data_url(url: &str) -> Option<(String, String)> {
 ///
 /// 历史 `reasoning_content` 不回传：thinking block 需要配套签名，伪造签名回传给上游
 /// 只会增加被拒风险，而丢弃它不影响后续对话。
-fn convert_assistant_message(msg: &Value) -> Vec<Value> {
+fn convert_assistant_message(
+    msg: &Value,
+    original_to_short: &HashMap<String, String>,
+) -> Vec<Value> {
     let mut blocks = Vec::new();
 
     match msg.get("content") {
@@ -307,7 +392,7 @@ fn convert_assistant_message(msg: &Value) -> Vec<Value> {
 
     if let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
-            if let Some(block) = convert_tool_call(call) {
+            if let Some(block) = convert_tool_call(call, original_to_short) {
                 blocks.push(block);
             }
         }
@@ -317,7 +402,7 @@ fn convert_assistant_message(msg: &Value) -> Vec<Value> {
 }
 
 /// 单个 `tool_calls[]` 项 → Anthropic `tool_use` block
-fn convert_tool_call(call: &Value) -> Option<Value> {
+fn convert_tool_call(call: &Value, original_to_short: &HashMap<String, String>) -> Option<Value> {
     let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
     let function = call.get("function")?;
     let name = function.get("name").and_then(Value::as_str)?;
@@ -327,8 +412,12 @@ fn convert_tool_call(call: &Value) -> Option<Value> {
     }
 
     let input = parse_tool_arguments(function.get("arguments"), name);
+    let short_name = original_to_short
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| kiro_tool_name(name));
 
-    Some(json!({"type": "tool_use", "id": id, "name": name, "input": input}))
+    Some(json!({"type": "tool_use", "id": id, "name": short_name, "input": input}))
 }
 
 /// 解析工具调用入参：JSON 字符串（协议规定形态）或对象（部分客户端的宽松形态）
@@ -598,6 +687,73 @@ mod tests {
         assert_eq!(
             r.anthropic_body["tools"][0]["input_schema"],
             json!({"type": "object", "properties": {}})
+        );
+    }
+
+    #[test]
+    fn invalid_tool_names_are_normalized_stably() {
+        for original in ["namespace.tool:name", "工具.调用", ""] {
+            let a = kiro_tool_name(original);
+            let b = kiro_tool_name(original);
+            assert_eq!(a, b);
+            assert!(!a.is_empty());
+            assert!(a.chars().count() <= MAX_KIRO_TOOL_NAME_CHARS);
+            assert!(
+                a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            );
+        }
+    }
+
+    #[test]
+    fn historical_long_tool_name_without_declaration_is_still_restorable() {
+        let original = "mcp__codex_apps__codex_document_control___execute_document_command";
+        let r = convert_ok(json!({
+            "model": "gpt-5-codex",
+            "messages": [
+                {"role": "user", "content": "run"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": original, "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "done"}
+            ]
+        }));
+        let short = r.anthropic_body["messages"][1]["content"][0]["name"]
+            .as_str()
+            .unwrap();
+        assert_ne!(short, original);
+        assert_eq!(
+            r.tool_name_map.get(short).map(String::as_str),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn long_tool_names_are_shortened_and_restorable() {
+        let original = "mcp__codex_apps__codex_document_control___execute_document_command";
+        let r = convert_ok(json!({
+            "model": "gpt-5-codex",
+            "messages": [
+                {"role": "user", "content": "run"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": original, "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "done"}
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": original, "description": "test",
+                "parameters": {"type": "object"}
+            }}]
+        }));
+        let short = r.anthropic_body["tools"][0]["name"].as_str().unwrap();
+        assert!(short.chars().count() <= MAX_KIRO_TOOL_NAME_CHARS);
+        assert_ne!(short, original);
+        assert_eq!(r.anthropic_body["messages"][1]["content"][0]["name"], short);
+        assert_eq!(
+            r.tool_name_map.get(short).map(String::as_str),
+            Some(original)
         );
     }
 
@@ -903,5 +1059,18 @@ mod tests {
             r.anthropic_body["messages"],
             json!([{"role": "user", "content": [{"type": "text", "text": "orphan"}]}])
         );
+    }
+}
+#[cfg(test)]
+mod review_20261001 {
+    use super::*;
+    #[test]
+    fn aliases_cannot_impersonate_real_tool_names_or_case_variants() {
+        let original = "long/invalid/name";
+        let alias = kiro_tool_name(original);
+        assert_ne!(kiro_tool_name(&alias), alias);
+        assert_ne!(kiro_tool_name("Read"), kiro_tool_name("read"));
+        assert_eq!(kiro_tool_name("read"), "read");
+        assert!(alias.len() <= 64);
     }
 }

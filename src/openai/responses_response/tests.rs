@@ -2,7 +2,7 @@
 #![cfg(test)]
 
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::nonstream::*;
 use super::stream::*;
@@ -147,6 +147,23 @@ mod tests {
         assert_eq!(created["response"]["status"], json!("in_progress"));
         assert_eq!(created["response"]["output"], json!([]));
         assert_eq!(created["response"]["usage"], Value::Null);
+    }
+
+    #[test]
+    fn partial_delta_usage_preserves_message_start_input_tokens() {
+        let frames = run_stream(&[
+            (
+                "message_start",
+                json!({"message": {"usage": {"input_tokens": 10}}}),
+            ),
+            ("message_delta", json!({"usage": {"output_tokens": 3}})),
+            ("message_stop", json!({})),
+        ]);
+        let (_, completed) = parse_frame(frames.last().unwrap());
+        let usage = &completed["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 10);
+        assert_eq!(usage["output_tokens"], 3);
+        assert_eq!(usage["total_tokens"], 13);
     }
 
     #[test]
@@ -393,7 +410,7 @@ mod tests {
 
     #[test]
     fn truncated_stream_ends_with_response_incomplete() {
-        for reason in ["max_tokens", "model_context_window_exceeded"] {
+        for reason in ["max_tokens"] {
             let frames = run_stream(&[
                 (
                     "content_block_start",
@@ -432,7 +449,7 @@ mod tests {
     fn finish_is_idempotent() {
         let mut conv = ResponsesStreamConverter::new("gpt-5.6-terra", HashSet::new());
         conv.on_event("message_start", &json!({"message": {"id": "msg_up"}}));
-        let first = conv.finish();
+        let first = conv.on_event("message_stop", &json!({}));
         assert_eq!(event_names(&first), vec!["response.completed"]);
         assert!(conv.finish().is_empty());
     }
@@ -462,7 +479,7 @@ mod tests {
                 "response.output_text.done",
                 "response.content_part.done",
                 "response.output_item.done",
-                "response.completed",
+                "response.failed",
             ]
         );
     }
@@ -538,6 +555,26 @@ mod tests {
     }
 
     #[test]
+    fn context_window_exceeded_stream_ends_with_response_failed() {
+        let frames = run_stream(&[
+            ("message_start", json!({})),
+            (
+                "message_delta",
+                json!({"delta": {"stop_reason": "model_context_window_exceeded"}}),
+            ),
+            ("message_stop", json!({})),
+        ]);
+        let names = event_names(&frames);
+        assert_eq!(names.last().unwrap(), "response.failed");
+        let (_, failed) = parse_frame(frames.last().unwrap());
+        assert_eq!(
+            failed["response"]["error"]["code"],
+            json!("context_length_exceeded")
+        );
+        assert!(!names.iter().any(|name| name == "response.completed"));
+    }
+
+    #[test]
     fn upstream_error_event_terminates_without_completed() {
         let mut conv = ResponsesStreamConverter::new("gpt-5.6-terra", HashSet::new());
         let mut frames = conv.on_event("message_start", &json!({"message": {"id": "msg_up"}}));
@@ -551,10 +588,14 @@ mod tests {
         let names = event_names(&frames);
         assert_eq!(
             names,
-            vec!["response.created", "response.in_progress", "error"]
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.failed"
+            ]
         );
         let (_, err) = parse_frame(frames.last().unwrap());
-        assert_eq!(err["message"], json!("上游繁忙"));
+        assert_eq!(err["response"]["error"]["message"], json!("上游繁忙"));
     }
 
     #[test]
@@ -584,7 +625,7 @@ mod tests {
                 .filter(|n| *n == "response.output_item.done")
                 .count(),
         );
-        assert_eq!(names.last().unwrap(), "error");
+        assert_eq!(names.last().unwrap(), "response.failed");
         assert!(!names.iter().any(|n| n == "response.completed"));
         assert!(!names.iter().any(|n| n == "response.incomplete"));
 
@@ -662,6 +703,44 @@ mod tests {
             "gpt-5-codex",
         );
         assert_eq!(out["output"][0]["content"][0]["text"], "前半后半");
+    }
+
+    #[test]
+    fn restores_short_tool_name_in_nonstream_response() {
+        let short = "mcp__codex_apps__codex_document_control___exec__123456789abc";
+        let original = "mcp__codex_apps__codex_document_control___execute_document_command";
+        let map = HashMap::from([(short.to_string(), original.to_string())]);
+        let out = super::convert_non_stream_with_tool_name_map(
+            &json!({
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": short, "input": {}}],
+                "stop_reason": "tool_use"
+            }),
+            "gpt-5-codex",
+            &HashSet::new(),
+            &map,
+        );
+        assert_eq!(out["output"][0]["name"], original);
+    }
+
+    #[test]
+    fn restores_short_tool_name_in_stream_response() {
+        let short = "mcp__codex_apps__codex_document_control___exec__123456789abc";
+        let original = "mcp__codex_apps__codex_document_control___execute_document_command";
+        let map = HashMap::from([(short.to_string(), original.to_string())]);
+        let mut conv =
+            ResponsesStreamConverter::new_with_tool_name_map("gpt-5.6-terra", HashSet::new(), map);
+        let frames = conv.on_event(
+            "content_block_start",
+            &json!({"index": 0, "content_block": {
+                "type": "tool_use", "id": "toolu_1", "name": short
+            }}),
+        );
+        let parsed = parse_all(&frames);
+        let added = parsed
+            .iter()
+            .find(|(name, _)| name == "response.output_item.added")
+            .expect("应有 output_item.added");
+        assert_eq!(added.1["item"]["name"], original);
     }
 
     #[test]
@@ -760,23 +839,32 @@ mod tests {
 
     #[test]
     fn max_tokens_stop_reason_yields_incomplete_status() {
-        for reason in ["max_tokens", "model_context_window_exceeded"] {
-            let out = convert_non_stream(
-                &json!({
-                    "content": [{"type": "text", "text": "半句"}],
-                    "stop_reason": reason,
-                }),
-                "gpt-5-codex",
-            );
-            assert_eq!(out["status"], "incomplete", "stop_reason={reason}");
-            assert_eq!(
-                out["incomplete_details"],
-                json!({"reason": "max_output_tokens"}),
-                "stop_reason={reason}"
-            );
-            // 已产出的内容仍要保留
-            assert_eq!(out["output"][0]["content"][0]["text"], "半句");
-        }
+        let out = convert_non_stream(
+            &json!({
+                "content": [{"type": "text", "text": "半句"}],
+                "stop_reason": "max_tokens",
+            }),
+            "gpt-5-codex",
+        );
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(
+            out["incomplete_details"],
+            json!({"reason": "max_output_tokens"})
+        );
+        assert_eq!(out["output"][0]["content"][0]["text"], "半句");
+    }
+
+    #[test]
+    fn context_window_exceeded_has_distinct_nonstream_reason() {
+        let out = convert_non_stream(
+            &json!({
+                "content": [{"type": "text", "text": "半句"}],
+                "stop_reason": "model_context_window_exceeded",
+            }),
+            "gpt-5-codex",
+        );
+        assert_eq!(out["status"], "failed");
+        assert_eq!(out["error"]["code"], json!("context_length_exceeded"));
     }
 
     #[test]
@@ -952,22 +1040,20 @@ mod tests {
 
     #[test]
     fn interrupted_custom_tool_stream_yields_partial_json_as_input() {
-        let mut conv = ResponsesStreamConverter::new("gpt-5.6-terra", custom_names(&["exec"]));
+        let mut conv = ResponsesStreamConverter::new("m", custom_names(&["exec"]));
         conv.on_event(
             "content_block_start",
-            &json!({"index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "exec"}}),
+            &json!({"index":0,"content_block":{"type":"tool_use","id":"c","name":"exec"}}),
         );
-        conv.on_event(
-            "content_block_delta",
-            &json!({"index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"input\":\"ls"}}),
-        );
+        conv.on_event("content_block_delta", &json!({"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"input\":\"half"}}));
         let frames = conv.finish();
-        let parsed = parse_all(&frames);
-        // 半截 JSON 解不出 input 字段，原样下发而不是丢空串
-        let done = parsed
-            .iter()
-            .find(|(n, _)| n == "response.custom_tool_call_input.done")
-            .expect("应有 input.done 事件");
-        assert_eq!(done.1["input"], json!("{\"input\":\"ls"));
+        assert!(
+            !event_names(&frames)
+                .iter()
+                .any(|n| n == "response.custom_tool_call_input.done")
+        );
+        let (_, last) = parse_frame(frames.last().unwrap());
+        assert_eq!(last["response"]["status"], "failed");
+        assert_eq!(last["response"]["output"][0]["status"], "incomplete");
     }
 }

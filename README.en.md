@@ -480,6 +480,7 @@ Lower `priority` value = higher priority. Up to 3 retries per account, 9 per req
 | `proxyPassword` | No | — | Proxy password |
 | `tlsBackend` | No | `rustls` | TLS backend: `rustls` or `native-tls` |
 | `loadBalancingMode` | No | `priority` | `priority` (by priority) or `balanced` (round-robin) |
+| `responseStoreTenantHeader` | No | — | Trusted reverse-proxy tenant header; scopes Responses continuation history within an API key |
 
 > **TLS note**: If you encounter token refresh failures or request errors, try switching `tlsBackend` to `native-tls`.
 
@@ -661,9 +662,39 @@ print(resp.choices[0].message.content)
 
 Model name can be `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-5.6-sol`, or any `claude-*` model name (passed through as-is to upstream). Codex CLI's built-in `gpt-5-codex` / `gpt-5.1-codex` auto-map to `gpt-5.6-terra`, and `gpt-5.1-codex-max` maps to `gpt-5.6-luna`.
 
+### Reverse proxy through new-api with a shared upstream key
+
+**No New API source patch, rebuild, or companion PR is required.** Its existing Header Override copies client Authorization; Kiro alone canonicalizes and derives the continuation scope.
+
+Kiro config.json (remove the legacy `responseStoreTenantHeader`; the modes are mutually exclusive):
+
+```json
+{"responseStoreClientAuthorizationHeader":"X-Kiro2CC-Client-Authorization"}
+```
+
+Set Kiro's `RESPONSE_STORE_HMAC_KEY` to a securely generated, stable **64-character hexadecimal key** (32 bytes), for example using `openssl rand -hex 32` on the server and protected secret/environment injection. Never commit it. `RESPONSE_STORE_CLIENT_AUTHORIZATION_HEADER` may configure the header name. Bad/empty header configuration, missing/invalid key, and dual modes fail startup instead of disabling isolation.
+
+Use this existing New API channel Header Override:
+
+```json
+{"X-Kiro2CC-Client-Authorization":"{client_header:Authorization}"}
+```
+
+Keep normal upstream Authorization set to the Kiro channel credential. Never use `{api_key}` for the client header. **Do not enable wildcard/regex/pass_headers or dynamic parameter-header mutations for this internal header**: an absent source Authorization causes the old gateway to skip its explicit override. Prefer exactly the single override above for this channel. Remove the old X-Kiro2CC-Tenant / `{authenticated_tenant}` recipe; companion New API PR #12 is unnecessary.
+
+The supported grammar deliberately matches only the verified standard Authorization subset: Bearer/bearer or a raw key, optional sk- prefix, a case-sensitive 32–128 character ASCII alphanumeric base key. The forwarded Authorization must be the credential that authenticated the request. Alternate midjourney-proxy/mj-api-secret authentication, channel-selection suffixes, or unverified route transformations are rejected/not supported; Kiro does not infer identity from body user/metadata, IP, or arbitrary tenant headers.
+
+Storage (default store=true) and ALL continuations require a client identity. Missing credentials permit only explicit store=false with no previous_response_id/item_reference; use Chat or models for channel self-tests. Malformed, duplicated, coalesced, oversized, literal-placeholder, or gateway-key-as-client values fail even for stateless requests.
+
+Kiro strips the raw client credential header at its authentication boundary, retains only an HMAC scope in request identity/store, and never sends the header to model upstreams. This requires a trusted private gateway deployment and protected transport; HMAC is a namespace, not independent authentication or protection against a misconfigured gateway. Do not log/capture complete headers in proxies/APM.
+
+Use the actual reachable Kiro address/port without /v1 (default 8080, not the old example 5678). Keep disable_store off; use store=true for responses to resume. State remains process-local: restarts lose histories and multiple instances need affinity. HMAC key rotation changes scopes; different downstream API keys remain isolated even under one user. Shared Kiro-key usage/RPM/quota remain aggregated, with end-user billing and limits owned by New API.
+
+See [config-only integration](docs/new-api-config-only.md) and [integration audit](docs/stateful-integration-audit.md).
+
 ### Known Limitations
 
-- **`previous_response_id` is not supported** — the proxy is stateless and doesn't persist prior responses. Requests containing this field return 400 immediately without an upstream call; send the full conversation history in `input` instead (Codex CLI already does this by default, no extra config needed).
+- **`previous_response_id` uses an in-process state store** — with the default `store=true`, continuation history is isolated by API key; when `responseStoreTenantHeader` is configured, it is additionally scoped by the trusted proxy tenant header. Entries are retained for 1 hour; `store=false` disables persistence. State does not survive process restarts or span multiple instances, so multi-instance deployments should keep a conversation sticky to one instance until a shared store is added.
 - **`tool_choice` only supports `auto`** — other values (`required` or a specific function name) are logged as WARN and treated as `auto`; this is an existing limitation of the upstream Kiro API.
 - **`reasoning.effort` has no effect on `gpt-5.6-luna`** — this model always returns `thinking=0` upstream.
 - **`include: ["reasoning.encrypted_content"]` is ignored** — the proxy doesn't produce encrypted reasoning content.

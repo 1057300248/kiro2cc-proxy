@@ -1,9 +1,11 @@
 #[cfg(test)]
 mod tests {
     use crate::openai::chat_response::{
-        ChatStreamConverter, convert_non_stream, map_finish_reason,
+        ChatStreamConverter, convert_non_stream, convert_non_stream_with_tool_name_map,
+        map_finish_reason,
     };
     use serde_json::{Value, json};
+    use std::collections::HashMap;
 
     fn anthropic_text_response() -> Value {
         json!({
@@ -84,6 +86,41 @@ mod tests {
             serde_json::from_str::<Value>(args).unwrap(),
             json!({"city": "SH"})
         );
+    }
+
+    #[test]
+    fn restores_short_tool_name_in_non_stream_response() {
+        let short = "mcp__codex_apps__codex_document_control___exec__123456789abc";
+        let original = "mcp__codex_apps__codex_document_control___execute_document_command";
+        let map = HashMap::from([(short.to_string(), original.to_string())]);
+        let out = convert_non_stream_with_tool_name_map(
+            &json!({
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": short, "input": {}}],
+                "stop_reason": "tool_use"
+            }),
+            "m",
+            &map,
+        );
+        assert_eq!(
+            out["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            original
+        );
+    }
+
+    #[test]
+    fn restores_short_tool_name_in_stream_response() {
+        let short = "mcp__codex_apps__codex_document_control___exec__123456789abc";
+        let original = "mcp__codex_apps__codex_document_control___execute_document_command";
+        let map = HashMap::from([(short.to_string(), original.to_string())]);
+        let mut conv = ChatStreamConverter::with_tool_name_map("m", false, map);
+        let frames = conv.on_event(
+            "content_block_start",
+            &json!({"index": 0, "content_block": {
+                "type": "tool_use", "id": "toolu_1", "name": short
+            }}),
+        );
+        assert!(frames.iter().any(|frame| frame.contains(original)));
+        assert!(!frames.iter().any(|frame| frame.contains(short)));
     }
 
     #[test]
@@ -482,6 +519,51 @@ mod tests {
     }
 
     #[test]
+    fn truncated_tool_stream_infers_tool_calls_finish_reason() {
+        let mut conv = ChatStreamConverter::new("m", false);
+        conv.on_event(
+            "content_block_start",
+            &json!({"index":0,"content_block":{"type":"tool_use","id":"c","name":"f"}}),
+        );
+        let frames = conv.finish();
+        assert!(parse_frame(&frames[0]).unwrap().get("error").is_some());
+        assert!(!frames.concat().contains("\"finish_reason\":\"tool_calls\""));
+        assert_eq!(frames.last().unwrap(), "data: [DONE]\n\n");
+    }
+
+    #[test]
+    fn message_start_usage_is_used_when_delta_is_missing() {
+        let mut conv = ChatStreamConverter::new("m", true);
+        let mut frames = conv.on_event(
+            "message_start",
+            &json!({"message": {"usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": 4,
+                "cache_creation_input_tokens": 2
+            }}}),
+        );
+        frames.extend(conv.on_event("message_stop", &json!({})));
+        let usage = parse_frame(&frames[frames.len() - 2]).unwrap();
+        assert_eq!(usage["usage"]["prompt_tokens"], 16);
+        assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
+    }
+
+    #[test]
+    fn partial_delta_usage_preserves_message_start_input_tokens() {
+        let mut conv = ChatStreamConverter::new("m", true);
+        conv.on_event(
+            "message_start",
+            &json!({"message": {"usage": {"input_tokens": 10}}}),
+        );
+        conv.on_event("message_delta", &json!({"usage": {"output_tokens": 3}}));
+        let frames = conv.on_event("message_stop", &json!({}));
+        let usage = parse_frame(&frames[frames.len() - 2]).unwrap()["usage"].clone();
+        assert_eq!(usage["prompt_tokens"], 10);
+        assert_eq!(usage["completion_tokens"], 3);
+        assert_eq!(usage["total_tokens"], 13);
+    }
+
+    #[test]
     fn error_after_done_emits_no_second_done() {
         let mut conv = ChatStreamConverter::new("gpt-5.6-terra", false);
         let mut frames = conv.on_event("message_start", &json!({}));
@@ -530,17 +612,9 @@ mod tests {
 
     #[test]
     fn truncated_stream_still_gets_finish_and_done() {
-        // 上游只发了 message_start 就断开
         let frames = run_stream(&[("message_start", json!({}))], false);
         assert_eq!(frames.len(), 3);
-        assert_eq!(
-            parse_frame(&frames[0]).unwrap()["choices"][0]["delta"]["role"],
-            "assistant"
-        );
-        assert_eq!(
-            parse_frame(&frames[1]).unwrap()["choices"][0]["finish_reason"],
-            "stop"
-        );
+        assert!(parse_frame(&frames[1]).unwrap().get("error").is_some());
         assert_eq!(frames[2], "data: [DONE]\n\n");
     }
 

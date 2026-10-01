@@ -501,6 +501,7 @@ Kiro 上游的 4 个接入端点（`ide` / `runtime` / `codewhisperer` / `amazon
 | `proxyPassword` | 否 | — | 代理密码 |
 | `tlsBackend` | 否 | `rustls` | TLS 后端：`rustls` 或 `native-tls` |
 | `loadBalancingMode` | 否 | `priority` | `priority`（按优先级）或 `balanced`（轮询） |
+| `responseStoreTenantHeader` | 否 | — | 可信反代传入的租户身份请求头；配置后按该请求头隔离 Responses 续接历史 |
 
 > **TLS 说明**：如遇到 Token 刷新失败或请求报错，尝试将 `tlsBackend` 改为 `native-tls`。
 
@@ -682,9 +683,39 @@ print(resp.choices[0].message.content)
 
 模型名可填 `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-5.6-sol`，也可直接填 `claude-*` 系模型名（原样透传给上游）。Codex CLI 自带的 `gpt-5-codex` / `gpt-5.1-codex` 会自动映射到 `gpt-5.6-terra`，`gpt-5.1-codex-max` 映射到 `gpt-5.6-luna`。
 
+### 通过 new-api 反代并共享上游 Key
+
+**New API 不需要改源码或合入专用 PR。**只使用已有的渠道 Header Override；身份规范化、HMAC 与续接隔离全部在 Kiro 内完成。
+
+在 Kiro 的 `config.json` 设置（移除旧 `responseStoreTenantHeader`，两种模式不能并用）：
+
+```json
+{"responseStoreClientAuthorizationHeader":"X-Kiro2CC-Client-Authorization"}
+```
+
+设置 Kiro 环境变量 `RESPONSE_STORE_HMAC_KEY` 为随机生成并妥善保存的 **64 位十六进制字符串**（32 字节），例如在服务器执行 `openssl rand -hex 32` 后通过密钥管理或受保护的环境文件注入。不要提交密钥到仓库。头名称也可用 `RESPONSE_STORE_CLIENT_AUTHORIZATION_HEADER` 配置；空值、无效头、缺失/非法密钥或双模式会拒绝启动，不降级到共享范围。
+
+在 New API 的 Kiro 渠道中，Header Override 使用下面的明确配置：
+
+```json
+{"X-Kiro2CC-Client-Authorization":"{client_header:Authorization}"}
+```
+
+正常上游 `Authorization` 仍由渠道设置生成，使用 Kiro 网关 Key。不要覆盖它，也不要把 `{api_key}` 当作客户凭据。**禁止该内部头的通配、正则、pass_headers 或动态参数覆盖透传**，因为源 Authorization 缺失时旧网关会跳过显式覆盖；推荐此渠道的整个头覆盖仅使用上述一项。清除旧 `X-Kiro2CC-Tenant`/`{authenticated_tenant}` 配置，无需合入 New API PR #12。
+
+只支持经核对的标准 New API Authorization 子集：`Bearer`/`bearer` 或裸 Key，可带 `sk-`，基础 Key 为 32–128 位 ASCII 字母数字且区分大小写。保留该路径实际完成鉴权的前提；`midjourney-proxy`/`mj-api-secret` 备用鉴权、渠道选择后缀、特殊路由转换不猜测支持。不通过 `user`、IP、body metadata 或任意租户头补全身份。
+
+有状态请求（默认 `store=true`）和任何续接均需要有效客户身份。缺失头时只允许明确 `store=false`、无 previous_response_id/item_reference 的无状态请求；渠道自检优先使用 Chat 或 models。畸形、重复、逗号合并、超长、未展开占位符或误传网关 Key 会拒绝，不能伪装成缺失身份继续。
+
+Kiro 在鉴权边界生成派生范围后移除原始凭据头，不传给模型上游、不存入续接历史或错误信息。Kiro 必须是可信内部服务，公网无法绕过 New API 直接调用；跨主机使用受保护的传输。HMAC 是命名空间派生，不是独立鉴权，也不能弥补错误网关配置。日志/APM 不应捕获完整请求头。
+
+Base URL 使用实际 Kiro 地址与端口，不追加 `/v1`；默认端口为 8080，5678 仅为旧示例。保持 `disable_store` 关闭，对需要续接的轮次使用 `store=true`。状态仍为进程内存，多实例需同实例粘滞；重启会丢历史。HMAC 密钥轮换会改变范围；同一客户不同 API Key 不共享历史。Kiro 的共享 Key 用量/RPM/额度仍聚合，New API 继续负责终端计费和限流。
+
+更多迁移与边界见 [零 New API 源码改动接入说明](docs/new-api-config-only.md) 和 [功能集成审计](docs/stateful-integration-audit.md)。
+
 ### 已知限制
 
-- **不支持 `previous_response_id`** —— 代理无状态，不保存历史响应。带该字段的请求直接返回 400 且不产生上游调用；请在 `input` 中回传完整对话历史（Codex CLI 默认即如此，无需额外配置）。
+- **`previous_response_id` 为进程内有状态实现** —— 默认 `store=true` 时按 API Key 隔离保存续接历史；配置 `responseStoreTenantHeader` 后，会在 API Key 内再按可信反代租户头隔离。TTL 为 1 小时；`store=false` 不保存。本实现不跨进程/重启持久化，多实例部署时应保持同一会话粘滞到同一实例或后续接入共享存储。
 - **`tool_choice` 仅支持 `auto`** —— 其他取值（`required` / 指定函数名）会记 WARN 后按 `auto` 处理，这是上游 Kiro API 的既有限制。
 - **`reasoning.effort` 对 `gpt-5.6-luna` 无效** —— 该模型上游恒返回 `thinking=0`。
 - **`include: ["reasoning.encrypted_content"]` 被忽略** —— 代理不产出加密 reasoning 内容。

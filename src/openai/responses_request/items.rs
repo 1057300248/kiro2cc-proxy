@@ -33,12 +33,12 @@ pub(crate) fn convert_input_items(
         match item_type {
             "message" => convert_message_item(item, system, acc),
             "function_call" => {
-                if let Some(block) = tool_use_block(item, ToolInputForm::Json) {
+                if let Some(block) = tool_use_block(item, ToolInputForm::Json, tools) {
                     acc.push("assistant", vec![block]);
                 }
             }
             "custom_tool_call" => {
-                if let Some(block) = tool_use_block(item, ToolInputForm::FreeText) {
+                if let Some(block) = tool_use_block(item, ToolInputForm::FreeText, tools) {
                     acc.push("assistant", vec![block]);
                 }
             }
@@ -155,7 +155,7 @@ fn convert_content_part(part: &Value) -> Option<Value> {
 }
 
 /// `function_call` / `custom_tool_call` → Anthropic `tool_use` block
-fn tool_use_block(item: &Value, form: ToolInputForm) -> Option<Value> {
+fn tool_use_block(item: &Value, form: ToolInputForm, tools: &mut ToolCollector) -> Option<Value> {
     let id = call_id(item)?;
     let name = item
         .get("name")
@@ -181,7 +181,8 @@ fn tool_use_block(item: &Value, form: ToolInputForm) -> Option<Value> {
         }
     };
 
-    Some(json!({"type": "tool_use", "id": id, "name": name, "input": input}))
+    let upstream_name = tools.alias_name(name);
+    Some(json!({"type": "tool_use", "id": id, "name": upstream_name, "input": input}))
 }
 
 /// `function_call_output` / `custom_tool_call_output` → Anthropic `tool_result` block

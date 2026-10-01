@@ -173,6 +173,10 @@ pub(crate) fn deadline_error_event() -> SseEvent {
     )
 }
 
+fn binary_stream_is_invalid(decoder: &EventStreamDecoder, eof: bool) -> bool {
+    decoder.is_stopped() || decoder.bytes_skipped() > 0 || (eof && decoder.buffer_len() > 0)
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
@@ -288,11 +292,7 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
-                            // 解码事件
-                            if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!("缓冲区溢出: {}", e);
-                            }
-
+                            let mut decode_failed = decoder.feed(&chunk).is_err();
                             let mut events = Vec::new();
                             for result in decoder.decode_iter() {
                                 match result {
@@ -307,21 +307,28 @@ fn create_sse_stream(
                                                 bridge_events.extend(sse_events);
                                             }
                                             events.extend(bridge_events);
+                                        } else {
+                                            decode_failed = true;
                                         }
                                     }
                                     Err(e) => {
                                         tracing::warn!("解码事件失败: {}", e);
+                                        decode_failed = true;
                                     }
                                 }
                             }
 
+                            decode_failed |= binary_stream_is_invalid(&decoder, false);
+                            if decode_failed {
+                                events.push(stream_interrupted_error_event());
+                            }
                             // 转换为 SSE 字节流
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, deadline, bridge, bridge_ctx, provider, round_in_flight)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, decode_failed, ping_interval, deadline, bridge, bridge_ctx, provider, round_in_flight)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -351,6 +358,10 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, deadline, bridge, bridge_ctx, provider, round_in_flight)))
                         }
                         None => {
+                            if binary_stream_is_invalid(&decoder, true) {
+                                let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(stream_interrupted_error_event().to_sse_string()))];
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, deadline, bridge, bridge_ctx, provider, round_in_flight)));
+                            }
                             // 桥接态（存在待执行搜索且无 in-flight 轮）→ spawn 后台
                             // 桥接轮（修复③ v2），JoinHandle 存入状态元组第 10 元，
                             // 由 select! 的条件分支收割；剩余 pending 在续流自然结束
@@ -503,4 +514,17 @@ fn create_sse_stream(
     .flatten();
 
     initial_stream.chain(processing_stream)
+}
+
+#[cfg(test)]
+mod transport_review_20261001 {
+    use super::*;
+    #[test]
+    fn binary_partial_frame_is_only_fatal_at_eof() {
+        let mut d = EventStreamDecoder::new();
+        assert!(!binary_stream_is_invalid(&d, true));
+        d.feed(&[0, 0]).unwrap();
+        assert!(!binary_stream_is_invalid(&d, false));
+        assert!(binary_stream_is_invalid(&d, true));
+    }
 }
