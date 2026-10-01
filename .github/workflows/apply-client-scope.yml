@@ -56,8 +56,8 @@ jobs:
           version: 9
       - name: Build embedded UIs
         run: |
-          (cd admin-ui && pnpm install && pnpm build)
-          (cd user-ui && npm install && npm run build)
+          (cd admin-ui && pnpm install && node ../.github/scripts/ensure-rollup-native.cjs && pnpm build)
+          (cd user-ui && npm install && node ../.github/scripts/ensure-rollup-native.cjs && npm run build)
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
